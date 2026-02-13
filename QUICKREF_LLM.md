@@ -158,19 +158,48 @@ curl http://localhost:8000/v1/models
 1. **函数签名信息**
    - 函数名、返回类型、参数列表
    
-2. **依赖关系**
+2. **函数源代码** ⭐ 新增
+   - 完整的函数实现
+   - 实际的业务逻辑
+   
+3. **头文件内容** ⭐ 新增
+   - 数据结构定义（如 Student）
+   - 函数声明
+   - 宏定义
+   
+4. **依赖关系**
    - 外部函数调用（需要mock）
    - Include文件
    
-3. **编译信息**
+5. **编译信息**
    - C/C++标准版本
    - 宏定义
    - 优化级别
 
-4. **生成要求**
+6. **生成要求**
    - 使用Google Test框架
    - 创建多个测试用例
    - 覆盖边界情况
+
+**示例prompt片段：**
+```
+=== FUNCTION SOURCE CODE ===
+int32_t add_student(const char* name, float score) {
+    if (validate_student_name(name) != 0) return -1;
+    // ... 完整实现
+}
+
+=== HEADER FILE: database.h ===
+typedef struct {
+    int32_t id;
+    char name[64];
+    float score;
+} Student;
+
+External Function Calls (requires mocking):
+  - validate_student_name()
+  - db_add_student()
+```
 
 ## 📈 质量控制
 

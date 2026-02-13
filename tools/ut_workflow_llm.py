@@ -135,10 +135,11 @@ class LLMUTWorkflow:
             # 获取编译信息
             compile_info = compile_info_map.get(fdep.source_file)
             
-            # 生成测试
+            # 生成测试（传递项目根目录）
             test_code = self.test_generator.generate_test_file(
                 fdep,
-                compile_info=compile_info
+                compile_info=compile_info,
+                project_root=self.project_dir
             )
             
             results[fname] = test_code

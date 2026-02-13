@@ -1,3 +1,4 @@
 build/
 build-ninja/
 build-ninja-msvc/
+__pycache__/
