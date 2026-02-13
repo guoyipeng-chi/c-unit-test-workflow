@@ -1,0 +1,258 @@
+# C Unit Test Workflow - 快速命令参考
+
+## 🎯 最常用命令
+
+```bash
+# ⭐⭐⭐ 完整工作流（推荐首选）
+python main.py --project . --full
+
+# ⭐⭐ 分步操作
+python main.py --project . --analyze --list   # 分析
+python main.py --project . --generate         # 生成
+python main.py --project . --build-and-run    # 编译+运行
+
+# ⭐ 其他操作
+python main.py --project . --run              # 只运行现有测试
+python main.py --project . --build            # 只编译
+python main.py --project . --info             # 显示信息
+python main.py --project . --help             # 显示帮助
+```
+
+## 🔧 高级命令
+
+```bash
+# 生成特定函数的测试
+python main.py --project . --generate --target validate_score
+
+# 编译并运行测试（不生成新代码）
+python main.py --project . --build-and-run
+
+# 验证项目结构完整性
+python verify_structure.py
+```
+
+## 📝 快速启动脚本
+
+```bash
+# Windows
+quickstart.bat
+
+# Linux/Mac
+bash quickstart.sh
+
+# Python
+python quickstart.py --demo
+```
+
+## 📊 工作流步骤
+
+| # | 步骤 | 输入 | 输出 | 时间 |
+|----|------|------|------|------|
+| 1️⃣ | 代码分析 | *.c, *.h 文件 | 函数信息、依赖关系 | <100ms |
+| 2️⃣ | 测试生成 | 函数信息 | *_test.cpp 文件 | <500ms |
+| 3️⃣ | 编译构建 | C/CPP源文件 | 可执行文件 | 5-60秒 |
+| 4️⃣ | 执行测试 | 可执行文件 | 测试报告 | <10秒 |
+
+## 📁 关键文件位置
+
+```
+项目根目录/
+├── src/                 # 你的C源代码
+├── include/             # 你的头文件
+├── test/                # 生成的测试代码 ← 修改这里的Mock
+├── build/               # 编译输出（自动生成）
+├── tools/               # 工作流脚本
+└── main.py              # 主入口
+```
+
+## 🔑 关键文件及其用途
+
+| 文件 | 用途 | 修改频率 |
+|------|------|----------|
+| src/*.c | C源代码 | 经常 |
+| include/*.h | 头文件 | 经常 |
+| test/*_test.cpp | 生成的测试 ⭐ | 有时 |
+| CMakeLists.txt | 编译配置 | 很少 |
+| main.py | 工作流入口 | 不修改 |
+| tools/*.py | 工作流引擎 | 不修改 |
+
+⭐ = 最常修改的地方
+
+## 🎨 生成的测试文件结构
+
+```cpp
+/* ========== MOCK DEFINITIONS - MODIFY HERE ========== */
+// ← 修改这里的Mock值
+#define MOCK_VALIDATE_SCORE_RETURN_VALUE  0
+/* ================================================= */
+
+class FunctionNameTest : public ::testing::Test { 
+    // ← SetUp/TearDown
+};
+
+// ← 生成的测试用例
+TEST_F(FunctionNameTest, TestCase1_NormalCase) { ... }
+TEST_F(FunctionNameTest, TestCase2_BoundaryCase) { ... }
+TEST_F(FunctionNameTest, TestCase3_ErrorCase) { ... }
+
+// ← 你可以添加自定义测试用例
+TEST_F(FunctionNameTest, CustomTest) { ... }
+```
+
+## 💾 工作流输出示例
+
+```
+$ python main.py --project . --full
+
+[Step 1/4] Code Analysis
+  ✓ Found 8 functions
+
+[Step 2/4] Test Code Generation
+  ✓ Generated: validator_test.cpp
+  ✓ Generated: database_test.cpp
+  ✓ Generated: student_manager_test.cpp
+
+[Step 3/4] Building Tests
+  ✓ Build completed successfully
+
+[Step 4/4] Running Tests
+  Total: 30, Passed: 30, Failed: 0 ✓
+```
+
+## ❓ 常见场景
+
+### 场景1: 我只想看看代码分析结果
+```bash
+python main.py --project . --analyze --list
+```
+
+### 场景2: 我修改了Mock定义，需要重新测试
+```bash
+python main.py --project . --build-and-run
+```
+
+### 场景3: 我只想运行测试，不重新编译
+```bash
+python main.py --project . --run
+```
+
+### 场景4: 我想看工作流的详细说明
+```bash
+python main.py --project . --info
+```
+
+### 场景5: 我想为特定函数生成测试
+```bash
+python main.py --project . --generate --target my_function
+```
+
+## ✅ 系统检查
+
+运行工作流前确保：
+
+```bash
+# 检查Python
+python --version                    # >= 3.7
+
+# 检查CMake
+cmake --version                     # >= 3.10
+
+# 检查编译器
+gcc --version                       # 或 clang/msvc
+
+# 检查项目结构
+python verify_structure.py          # 应该显示 ✓ All checks passed
+```
+
+## 🚨 故障排除
+
+### 问题: "cmake not found"
+```bash
+# Windows: 安装CMake
+# macOS: brew install cmake
+# Linux: sudo apt-get install cmake
+```
+
+### 问题: 编译失败
+```bash
+# 检查error信息
+cat build/CMakeFiles/CMakeOutput.log
+
+# 清理并重新编译
+rm -rf build
+python main.py --project . --build
+```
+
+### 问题: 测试失败
+```bash
+# 查看失败的测试详情
+python main.py --project . --run
+
+# 编辑test文件中的Mock值
+vim test/*_test.cpp
+
+# 重新运行
+python main.py --project . --build-and-run
+```
+
+## 📚 文档导航
+
+| 文档 | 适合 | 内容 |
+|------|------|------|
+| GETTING_STARTED.md | 新手 | 快速参考、30秒入门 |
+| README.md | 使用者 | 完整使用指南 |
+| ARCHITECTURE.md | 开发者 | 架构设计、扩展方法 |
+| API文档 | 代码注释 | 各模块详细说明 |
+
+## 🎓 学习路径
+
+```
+1️⃣ 查看本文件（QUICK_REFERENCE.txt）
+   ↓
+2️⃣ 运行 python main.py --project . --full
+   ↓
+3️⃣ 查看生成的 test/*_test.cpp
+   ↓
+4️⃣ 修改Mock定义值
+   ↓
+5️⃣ 添加自定义测试用例
+   ↓
+6️⃣ 读 README.md 了解更多
+   ↓
+7️⃣ 读 ARCHITECTURE.md 学习扩展
+```
+
+## 🎯 完整工作流（从头到尾）
+
+```bash
+# 第1步: 检查环境
+python verify_structure.py
+
+# 第2步: 分析代码
+python main.py --project . --analyze --list
+
+# 第3步: 生成测试
+python main.py --project . --generate
+
+# 第4步: 查看生成的测试
+cat test/*_test.cpp | head -50
+
+# 第5步: 编译并运行
+python main.py --project . --build-and-run
+
+# 第6步: （可选）修改Mock并重新运行
+# vim test/*_test.cpp
+# python main.py --project . --build-and-run
+```
+
+## 🏃 最快开始方式（10秒）
+
+```bash
+python main.py --project . --full
+```
+
+就这么简单！✨
+
+---
+
+**更多帮助**: 运行 `python main.py --help`
