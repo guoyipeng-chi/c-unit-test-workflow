@@ -28,6 +28,9 @@ python quickstart_llm.py --interactive
 | **详细文档** | [LLM_WORKFLOW_GUIDE.md](LLM_WORKFLOW_GUIDE.md) | 完整技术文档（32KB） |
 | **项目README** | [README.md](README.md) | 原始项目说明 |
 | **配置** | [llm_workflow_config.json](llm_workflow_config.json) | 工作流配置文件 |
+| **配置** | [vllm_config.env](vllm_config.env) | 环境变量配置（Linux/macOS） ⭐ 新增 |
+| **配置** | [vllm_config.ps1](vllm_config.ps1) | 环境变量配置（Windows PowerShell） ⭐ 新增 |
+| **配置** | [vllm_config.bat](vllm_config.bat) | 环境变量配置（Windows CMD） ⭐ 新增 |
 
 ---
 

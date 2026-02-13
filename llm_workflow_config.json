@@ -7,6 +7,12 @@
   
   "llm": {
     "api_base": "http://localhost:8000",
+    "api_base_comment": "可通过环境变量 VLLM_API_BASE 覆盖",
+    "remote_examples": {
+      "local": "http://localhost:8000",
+      "remote_server": "http://192.168.1.100:8000",
+      "cloud_server": "http://your-server.com:8000"
+    },
     "model": "qwen-coder",
     "temperature": 0.7,
     "max_tokens": 4096,

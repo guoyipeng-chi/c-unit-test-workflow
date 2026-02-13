@@ -6,6 +6,7 @@ LLM Client for vLLM Qwen3 Coder
 
 import requests
 import json
+import os
 from typing import Optional, Dict, List
 import logging
 
@@ -16,21 +17,40 @@ logger = logging.getLogger(__name__)
 class VLLMClient:
     """vLLM客户端，通过OpenAI API兼容接口调用Qwen3 Coder"""
     
-    def __init__(self, api_base: str = "http://localhost:8000", 
+    def __init__(self, api_base: Optional[str] = None, 
                  model: str = "qwen-coder", 
                  api_key: str = "dummy"):
         """
         初始化vLLM客户端
         
+        优先级: 环境变量 > 参数 > 默认值
+        
         Args:
-            api_base: vLLM服务的API地址 (默认: http://localhost:8000)
-            model: 模型名称 (默认: qwen-coder)
-            api_key: API密钥 (如果需要)
+            api_base: vLLM服务的API地址
+                环境变量: VLLM_API_BASE
+                默认: http://localhost:8000
+            model: 模型名称
+                环境变量: VLLM_MODEL
+                默认: qwen-coder
+            api_key: API密钥
+                环境变量: VLLM_API_KEY
+                默认: dummy
+        
+        示例:
+            # 使用环境变量
+            export VLLM_API_BASE=http://192.168.1.100:8000
+            client = VLLMClient()
+            
+            # 直接指定
+            client = VLLMClient(api_base="http://my-server:8000")
         """
-        self.api_base = api_base.rstrip('/')
-        self.model = model
-        self.api_key = api_key
-        self.timeout = 120
+        # 优先级: 环境变量 > 参数 > 默认值
+        self.api_base = (os.getenv('VLLM_API_BASE') or 
+                        api_base or 
+                        "http://localhost:8000").rstrip('/')
+        self.model = os.getenv('VLLM_MODEL') or model
+        self.api_key = os.getenv('VLLM_API_KEY') or api_key
+        self.timeout = int(os.getenv('VLLM_TIMEOUT', '120'))
         
         # 检查连接
         self._check_connection()

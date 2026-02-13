@@ -24,16 +24,18 @@ class LLMUTWorkflow:
     """集成LLM的UT生成工作流"""
     
     def __init__(self, project_dir: str, compile_commands_file: str,
-                 llm_api_base: str = "http://localhost:8000",
-                 llm_model: str = "qwen-coder"):
+                 llm_api_base: Optional[str] = None,
+                 llm_model: Optional[str] = None):
         """
         初始化工作流
+        
+        配置优先级: 环境变量 > 参数 > 默认值
         
         Args:
             project_dir: 项目根目录
             compile_commands_file: compile_commands.json路径
-            llm_api_base: vLLM API地址
-            llm_model: 模型名称
+            llm_api_base: vLLM API地址（可通过环境变量 VLLM_API_BASE 覆盖）
+            llm_model: 模型名称（可通过环境变量 VLLM_MODEL 覆盖）
         """
         self.project_dir = project_dir
         self.include_dir = os.path.join(project_dir, 'include')
@@ -47,9 +49,13 @@ class LLMUTWorkflow:
         self.compile_analyzer = CompileCommandsAnalyzer(compile_commands_file)
         self.compile_analyzer.analyze_all()
         
-        # 初始化LLM客户端
-        print(f"[Init] Connecting to vLLM at {llm_api_base}...")
-        self.llm_client = create_client(api_base=llm_api_base, model=llm_model)
+        # 获取最终的API地址（环境变量优先）
+        final_api_base = os.getenv('VLLM_API_BASE') or llm_api_base or "http://localhost:8000"
+        final_model = os.getenv('VLLM_MODEL') or llm_model or "qwen-coder"
+        
+        # 初始化LLM客户端（VLLMClient内部也会检查环境变量）
+        print(f"[Init] Connecting to vLLM at {final_api_base}...")
+        self.llm_client = VLLMClient(api_base=final_api_base, model=final_model)
         
         # 初始化LLM测试生成器
         self.test_generator = LLMTestGenerator(self.llm_client)
@@ -272,14 +278,15 @@ def main():
     
     parser.add_argument(
         "--llm-api",
-        default="http://localhost:8000",
-        help="vLLM API base URL (default: http://localhost:8000)"
+        default=None,
+        help="vLLM API base URL (优先级: 环境变量 VLLM_API_BASE > 命令行 > 默认localhost:8000). "
+             "示例: http://192.168.1.100:8000 或 http://your-server.com:8000"
     )
     
     parser.add_argument(
         "--llm-model",
-        default="qwen-coder",
-        help="LLM model name (default: qwen-coder)"
+        default=None,
+        help="LLM model name (环境变量: VLLM_MODEL, 默认: qwen-coder)"
     )
     
     parser.add_argument(

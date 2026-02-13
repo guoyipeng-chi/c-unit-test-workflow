@@ -6,6 +6,34 @@
 - ✅ compile_commands.json 已生成（本项目已有）
 - ✅ vLLM服务已启动（默认 http://localhost:8000）
 
+### 🌐 远程vLLM配置（推荐） ⭐
+
+**使用环境变量（最快）：**
+```bash
+# Linux/macOS
+export VLLM_API_BASE=http://192.168.1.100:8000
+export VLLM_MODEL=Qwen/Qwen2.5-Coder-32B-Instruct
+
+# Windows PowerShell
+$env:VLLM_API_BASE = "http://192.168.1.100:8000"
+.\vllm_config.ps1  # 或使用配置脚本
+
+# Windows CMD
+set VLLM_API_BASE=http://192.168.1.100:8000
+vllm_config.bat  # 或使用批处理
+```
+
+**或使用命令行参数：**
+```bash
+python tools/ut_workflow_llm.py \
+  --llm-api http://192.168.1.100:8000 \
+  --llm-model Qwen/Qwen2.5-Coder-32B-Instruct
+```
+
+📖 **详细配置:** 查看 [REMOTE_VLLM_SETUP.md](REMOTE_VLLM_SETUP.md)
+
+---
+
 ### 一句话启动
 
 ```bash
@@ -22,7 +50,7 @@ python tools/ut_workflow_llm.py --analyze-only
 
 # 方式4：为特定函数生成测试
 python tools/ut_workflow_llm.py \
-  --functions validate_name db_init add_student
+  --functions validate_student_name db_init add_student
 ```
 
 ## 📁 新增文件说明
@@ -42,7 +70,11 @@ python tools/ut_workflow_llm.py \
 |------|------|
 | `quickstart_llm.py` | 快速启动脚本 |
 | `llm_workflow_config.json` | 配置文件 |
+| `vllm_config.env` | 环境变量配置（Linux/macOS） |
+| `vllm_config.ps1` | 环境变量配置（Windows PowerShell） |
+| `vllm_config.bat` | 环境变量配置（Windows CMD） |
 | `LLM_WORKFLOW_GUIDE.md` | 详细文档 |
+| `REMOTE_VLLM_SETUP.md` | 远程vLLM配置指南 ⭐ |
 | `QUICKREF_LLM.md` | 本文档 |
 
 ## 🔧 工作流架构

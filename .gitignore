@@ -2,3 +2,25 @@ build/
 build-ninja/
 build-ninja-msvc/
 __pycache__/
+
+# 环境变量配置（可能包含敏感信息）
+.env
+.env.local
+*.local.env
+vllm_config.local.*
+
+# Python
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 测试生成的文件
+test/*_llm_test.cpp
+*.log
