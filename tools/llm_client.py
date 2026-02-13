@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""
+LLM Client for vLLM Qwen3 Coder
+使用OpenAI兼容的API调用远程vLLM服务的Qwen3 Coder
+"""
+
+import requests
+import json
+from typing import Optional, Dict, List
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class VLLMClient:
+    """vLLM客户端，通过OpenAI API兼容接口调用Qwen3 Coder"""
+    
+    def __init__(self, api_base: str = "http://localhost:8000", 
+                 model: str = "qwen-coder", 
+                 api_key: str = "dummy"):
+        """
+        初始化vLLM客户端
+        
+        Args:
+            api_base: vLLM服务的API地址 (默认: http://localhost:8000)
+            model: 模型名称 (默认: qwen-coder)
+            api_key: API密钥 (如果需要)
+        """
+        self.api_base = api_base.rstrip('/')
+        self.model = model
+        self.api_key = api_key
+        self.timeout = 120
+        
+        # 检查连接
+        self._check_connection()
+    
+    def _check_connection(self) -> bool:
+        """检查与vLLM服务的连接"""
+        try:
+            response = requests.get(
+                f"{self.api_base}/v1/models",
+                timeout=5,
+                headers={"Authorization": f"Bearer {self.api_key}"}
+            )
+            if response.status_code == 200:
+                logger.info(f"✓ Connected to vLLM service at {self.api_base}")
+                return True
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"✗ Cannot connect to vLLM: {e}")
+            return False
+    
+    def generate(self, prompt: str, 
+                temperature: float = 0.7, 
+                max_tokens: int = 4096,
+                top_p: float = 0.95) -> str:
+        """
+        调用vLLM生成文本
+        
+        Args:
+            prompt: 输入提示
+            temperature: 温度参数 (0-2, 默认0.7)
+            max_tokens: 最大生成token数 (默认4096)
+            top_p: nucleus采样参数 (默认0.95)
+            
+        Returns:
+            生成的文本
+        """
+        url = f"{self.api_base}/v1/completions"
+        
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "top_p": top_p,
+            "stop": ["<|end_header_id|>", "```"],
+        }
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
+        
+        try:
+            logger.info(f"Calling vLLM... (max_tokens={max_tokens})")
+            response = requests.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=self.timeout
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                if result.get("choices") and len(result["choices"]) > 0:
+                    generated_text = result["choices"][0].get("text", "")
+                    logger.info(f"✓ Generated {len(generated_text)} chars")
+                    return generated_text
+            else:
+                logger.error(f"API error: {response.status_code} - {response.text}")
+                
+        except requests.exceptions.Timeout:
+            logger.error(f"Request timeout after {self.timeout}s")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed: {e}")
+        
+        return ""
+    
+    def chat_complete(self, messages: List[Dict[str, str]], 
+                     temperature: float = 0.7,
+                     max_tokens: int = 4096) -> str:
+        """
+        调用Chat API (如果服务支持)
+        
+        Args:
+            messages: 消息列表 [{"role": "user", "content": "..."}, ...]
+            temperature: 温度参数
+            max_tokens: 最大生成token数
+            
+        Returns:
+            生成的响应
+        """
+        url = f"{self.api_base}/v1/chat/completions"
+        
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
+        
+        try:
+            logger.info("Calling vLLM chat API...")
+            response = requests.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=self.timeout
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                if result.get("choices") and len(result["choices"]) > 0:
+                    content = result["choices"][0]["message"].get("content", "")
+                    logger.info(f"✓ Generated response ({len(content)} chars)")
+                    return content
+            else:
+                logger.error(f"API error: {response.status_code}")
+                
+        except Exception as e:
+            logger.error(f"Chat request failed: {e}")
+        
+        return ""
+
+
+def create_client(api_base: str = "http://localhost:8000",
+                 model: str = "qwen-coder") -> VLLMClient:
+    """
+    工厂函数：创建vLLM客户端
+    
+    Args:
+        api_base: vLLM服务地址
+        model: 模型名称
+        
+    Returns:
+        VLLMClient实例
+    """
+    return VLLMClient(api_base=api_base, model=model)
+
+
+if __name__ == "__main__":
+    # 测试
+    client = VLLMClient()
+    prompt = "Write a simple C function that validates a student name"
+    response = client.generate(prompt, max_tokens=500)
+    print(response)

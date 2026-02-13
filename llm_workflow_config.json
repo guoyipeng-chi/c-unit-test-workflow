@@ -1,0 +1,45 @@
+{
+  "project": {
+    "name": "C Unit Test Workflow",
+    "version": "1.0",
+    "description": "LLM-based C unit test generation with vLLM and Qwen3 Coder"
+  },
+  
+  "llm": {
+    "api_base": "http://localhost:8000",
+    "model": "qwen-coder",
+    "temperature": 0.7,
+    "max_tokens": 4096,
+    "top_p": 0.95,
+    "timeout": 120
+  },
+  
+  "code_analysis": {
+    "include_patterns": ["*.h"],
+    "source_patterns": ["*.c"],
+    "exclude": [
+      "**/third_party/**",
+      "**/build/**",
+      "**/.git/**"
+    ]
+  },
+  
+  "test_generation": {
+    "framework": "gtest",
+    "output_suffix": "_llm_test.cpp",
+    "include_mocks": true,
+    "coverage_goal": 80,
+    "test_cases_per_function": {
+      "minimum": 5,
+      "recommended": 10
+    }
+  },
+  
+  "compile_commands": {
+    "search_paths": [
+      "./build/compile_commands.json",
+      "./build-ninja-msvc/compile_commands.json",
+      "./cmake-build-debug/compile_commands.json"
+    ]
+  }
+}
