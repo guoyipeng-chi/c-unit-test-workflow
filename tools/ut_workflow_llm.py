@@ -8,6 +8,7 @@ import sys
 import os
 import argparse
 import json
+import subprocess
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -303,6 +304,182 @@ class LLMUTWorkflow:
         
         return all_valid
     
+    def run_tests(self, test_dir: Optional[str] = None, build_dir: str = "build-test") -> bool:
+        """
+        编译并执行生成的测试用例
+        
+        Args:
+            test_dir: 测试文件所在目录
+            build_dir: 测试编译目录
+            
+        Returns:
+            是否执行成功
+        """
+        print("\n[Step 5/5] Compiling and running tests...")
+        print("=" * 60)
+        
+        if test_dir is None:
+            test_dir = self.test_dir
+        
+        test_files = [f for f in os.listdir(test_dir) if f.endswith('_llm_test.cpp')]
+        
+        if not test_files:
+            print("✗ No test files found to run!")
+            return False
+        
+        print(f"Found {len(test_files)} test file(s) to run")
+        
+        # 创建编译目录
+        build_path = os.path.join(self.project_dir, build_dir)
+        os.makedirs(build_path, exist_ok=True)
+        
+        # 使用CMake配置建立测试编译环境
+        print(f"\nSetting up CMake for tests in {build_path}...")
+        
+        try:
+            # 运行CMake配置
+            cmake_result = subprocess.run(
+                ["cmake", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON", "-S", self.project_dir, "-B", build_path],
+                capture_output=True,
+                timeout=60,
+                text=True
+            )
+            
+            if cmake_result.returncode != 0:
+                print("⚠ CMake configuration had issues, but continuing...")
+                if cmake_result.stderr:
+                    print(f"  Error: {cmake_result.stderr[:500]}")
+            else:
+                print("✓ CMake configured successfully")
+        except Exception as e:
+            print(f"⚠ CMake configuration failed: {e}")
+            print("  Attempting to run tests anyway...")
+        
+        # 收集源文件进行编译
+        source_files = []
+        for root, dirs, files in os.walk(self.src_dir):
+            for file in files:
+                if file.endswith('.c'):
+                    source_files.append(os.path.join(root, file))
+        
+        print(f"Found {len(source_files)} source file(s)")
+        
+        # 尝试编译并运行每个测试文件
+        all_passed = True
+        results = []
+        
+        for test_file in test_files:
+            test_path = os.path.join(test_dir, test_file)
+            test_name = os.path.splitext(test_file)[0]
+            exe_path = os.path.join(build_path, test_name)
+            
+            print(f"\n[Test] {test_file}")
+            print("-" * 40)
+            
+            # 构建编译命令
+            # 收集include目录
+            include_dirs = ["-I" + self.include_dir]
+            
+            # 从compile_commands.json中提取include路径
+            if hasattr(self.compile_analyzer, 'compile_info'):
+                for src_file, compile_info in self.compile_analyzer.compile_info.items():
+                    if 'includes' in compile_info:
+                        for inc in compile_info['includes']:
+                            if inc not in include_dirs:
+                                include_dirs.append("-I" + inc)
+            
+            # 准备编译命令
+            compile_cmd = ["g++", "-std=c99", "-o", exe_path]
+            compile_cmd.extend(include_dirs)
+            compile_cmd.append("-I/usr/include/gtest")
+            compile_cmd.extend(source_files)
+            compile_cmd.append(test_path)
+            compile_cmd.extend(["-lgtest", "-lgtest_main", "-lpthread"])
+            
+            try:
+                # 编译测试
+                print(f"Compiling: {test_name}...")
+                compile_result = subprocess.run(
+                    compile_cmd,
+                    capture_output=True,
+                    timeout=120,
+                    text=True,
+                    cwd=self.project_dir
+                )
+                
+                if compile_result.returncode != 0:
+                    print(f"  ✗ Compilation failed")
+                    if compile_result.stderr:
+                        # 只显示前几行错误信息
+                        error_lines = compile_result.stderr.split('\n')[:5]
+                        for line in error_lines:
+                            if line.strip():
+                                print(f"    {line}")
+                        if len(compile_result.stderr.split('\n')) > 5:
+                            print(f"    ... (more errors)")
+                    all_passed = False
+                    results.append((test_name, "COMPILE_FAILED"))
+                    continue
+                
+                print(f"  ✓ Compiled successfully")
+                
+                # 运行测试
+                print(f"Running: {test_name}...")
+                run_result = subprocess.run(
+                    [exe_path],
+                    capture_output=True,
+                    timeout=60,
+                    text=True,
+                    cwd=self.project_dir
+                )
+                
+                # 解析GTest输出
+                if run_result.returncode == 0:
+                    print(f"  ✓ All tests passed")
+                    results.append((test_name, "PASSED"))
+                    
+                    # 显示简要的测试统计
+                    output_lines = run_result.stderr.split('\n')
+                    for line in output_lines:
+                        if 'passed' in line.lower() or 'ok' in line.lower():
+                            print(f"    {line.strip()}")
+                else:
+                    print(f"  ✗ Some tests failed")
+                    results.append((test_name, "FAILED"))
+                    all_passed = False
+                    
+                    # 显示失败信息
+                    if run_result.stderr:
+                        error_lines = run_result.stderr.split('\n')
+                        for line in error_lines:
+                            if 'FAILED' in line or 'ERROR' in line or 'failed' in line:
+                                print(f"    {line.strip()}")
+            
+            except subprocess.TimeoutExpired:
+                print(f"  ✗ Test execution timeout")
+                results.append((test_name, "TIMEOUT"))
+                all_passed = False
+            except Exception as e:
+                print(f"  ✗ Error: {e}")
+                results.append((test_name, "ERROR"))
+                all_passed = False
+        
+        # 显示总结
+        print("\n" + "=" * 60)
+        print("Test Execution Summary")
+        print("=" * 60)
+        
+        for test_name, status in results:
+            status_symbol = "✓" if status == "PASSED" else "✗"
+            print(f"{status_symbol} {test_name:<40} {status}")
+        
+        if all_passed:
+            print("\n✓ All tests executed successfully!")
+        else:
+            print("\n⚠ Some tests failed or couldn't run")
+        
+        return all_passed
+
     def show_workflow_info(self) -> None:
         """显示工作流信息"""
         print("\n[LLM-based Unit Test Generation Workflow]")
@@ -319,18 +496,28 @@ Workflow Steps:
 2. Extract compile info - Parse compile_commands.json
 3. Generate tests - Use LLM to generate test code
 4. Verify tests - Basic validation of generated tests
+5. Run tests - Compile and execute tests with GTest
 
 Usage:
   python ut_workflow_llm.py --help
 """)
     
-    def run_full_workflow(self, target_functions: Optional[List[str]] = None) -> None:
-        """运行完整工作流"""
+    def run_full_workflow(self, target_functions: Optional[List[str]] = None, skip_run: bool = False) -> None:
+        """
+        运行完整工作流
+        
+        Args:
+            target_functions: 目标函数列表
+            skip_run: 是否跳过测试执行步骤
+        """
         self.show_workflow_info()
         self.analyze_codebase()
         self.print_compile_info()
         self.generate_tests(target_functions)
         self.verify_tests()
+        
+        if not skip_run:
+            self.run_tests()
         
         print("\n" + "=" * 60)
         print("✓ Workflow completed!")
@@ -422,6 +609,12 @@ def main():
         help="Only analyze codebase"
     )
     
+    parser.add_argument(
+        "--skip-run",
+        action="store_true",
+        help="Skip running tests (only generate, don't execute)"
+    )
+    
     args = parser.parse_args()
     
     # 优先从配置文件加载
@@ -461,7 +654,10 @@ def main():
         workflow.analyze_codebase()
         workflow.print_compile_info()
     else:
-        workflow.run_full_workflow(target_functions=args.functions)
+        workflow.run_full_workflow(
+            target_functions=args.functions,
+            skip_run=args.skip_run
+        )
 
 
 if __name__ == "__main__":
