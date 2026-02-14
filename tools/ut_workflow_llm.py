@@ -383,10 +383,16 @@ class LLMUTWorkflow:
             # 从compile_commands.json中提取include路径
             if hasattr(self.compile_analyzer, 'compile_info'):
                 for src_file, compile_info in self.compile_analyzer.compile_info.items():
-                    if 'includes' in compile_info:
-                        for inc in compile_info['includes']:
-                            if inc not in include_dirs:
-                                include_dirs.append("-I" + inc)
+                    include_list = []
+                    if hasattr(compile_info, 'include_dirs'):
+                        include_list = compile_info.include_dirs
+                    elif isinstance(compile_info, dict):
+                        include_list = compile_info.get('includes') or compile_info.get('include_dirs', [])
+                    
+                    for inc in include_list:
+                        include_flag = "-I" + inc
+                        if include_flag not in include_dirs:
+                            include_dirs.append(include_flag)
             
             # 准备编译命令
             compile_cmd = ["g++", "-std=c99", "-o", exe_path]
