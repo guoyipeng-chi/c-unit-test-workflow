@@ -2,17 +2,18 @@
 """
 LLM-based Test Generator
 使用Qwen3 Coder通过提示工程生成单元测试
+支持使用libclang进行精确的include依赖分析
 """
 
 import json
 import logging
 import os
 import re
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Set
 from dataclasses import dataclass
 from llm_client import VLLMClient
 from c_code_analyzer import FunctionDependency
-from compile_commands_analyzer import CompileInfo
+from compile_commands_analyzer import CompileInfo, CompileCommandsAnalyzer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,14 +22,16 @@ logger = logging.getLogger(__name__)
 class LLMTestGenerator:
     """基于LLM的测试代码生成器"""
     
-    def __init__(self, llm_client: VLLMClient):
+    def __init__(self, llm_client: VLLMClient, compile_analyzer: Optional[CompileCommandsAnalyzer] = None):
         """
         初始化LLM测试生成器
         
         Args:
             llm_client: VLLMClient实例
+            compile_analyzer: 可选的CompileCommandsAnalyzer实例（用于提取完整的include列表）
         """
         self.llm = llm_client
+        self.compile_analyzer = compile_analyzer
         self.system_prompt = self._build_system_prompt()
     
     def _build_system_prompt(self) -> str:
@@ -99,6 +102,9 @@ Return ONLY the C++ test code, no explanations."""
         # 读取依赖的头文件内容
         header_contents = self._read_header_files(func_dep, project_root)
         
+        # 使用libclang提取所有include（包括间接依赖）
+        all_includes = self._extract_all_includes(func_dep, compile_info, project_root)
+        
         # 基本信息
         prompt = f"""Generate comprehensive unit tests for this C function:
 
@@ -127,9 +133,9 @@ Parameters:
         else:
             prompt += f"\nExternal Function Calls: None\n"
         
-        # 依赖的头文件
+        # 包含的头文件（直接依赖）
         if func_dep.include_files:
-            prompt += f"\nInclude Files:\n"
+            prompt += f"\nDirect Include Files:\n"
             for inc in sorted(func_dep.include_files):
                 prompt += f"  - {inc}\n"
         
@@ -137,6 +143,14 @@ Parameters:
         if header_contents:
             for header_name, content in header_contents.items():
                 prompt += f"\n=== HEADER FILE: {header_name} ===\n```c\n{content}\n```\n"
+        
+        # 所有include文件（包括间接依赖和系统库）
+        if all_includes:
+            prompt += f"\n=== ALL REQUIRED INCLUDES (extracted by libclang) ===\n"
+            prompt += "These are ALL the include files that the test MUST include:\n"
+            for inc in sorted(all_includes):
+                prompt += f"#include <{inc}>\n" if '>' in inc or not '.' in inc else f'#include "{inc}"\n'
+            prompt += "\n"
         
         # 编译信息
         if compile_info:
@@ -216,6 +230,30 @@ TEST_F({func_dep.name.capitalize()}Test, BasicTest) {{
 }}
 """
         return test_template
+    
+    def _extract_all_includes(self, func_dep: FunctionDependency, 
+                             compile_info: Optional[CompileInfo],
+                             project_root: str) -> Set[str]:
+        """
+        使用libclang提取源文件的所有include（包括间接依赖）
+        
+        这调用compile_analyzer的extract_all_includes方法
+        """
+        if not self.compile_analyzer:
+            return set()
+        
+        try:
+            source_file = os.path.join(project_root, func_dep.source_file)
+            if not os.path.exists(source_file):
+                logger.warning(f"Source file not found: {source_file}")
+                return set()
+            
+            includes = self.compile_analyzer.extract_all_includes(source_file, compile_info)
+            logger.info(f"Extracted {len(includes)} includes for {func_dep.name}")
+            return includes
+        except Exception as e:
+            logger.error(f"Error extracting includes: {e}")
+            return set()
     
     def _read_function_source(self, func_dep: FunctionDependency, project_root: str) -> str:
         """读取函数的源代码"""

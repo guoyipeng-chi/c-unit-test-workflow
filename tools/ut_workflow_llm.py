@@ -70,8 +70,8 @@ class LLMUTWorkflow:
         print(f"[Init] Connecting to vLLM at {final_api_base}...")
         self.llm_client = VLLMClient(api_base=final_api_base, model=final_model)
         
-        # 初始化LLM测试生成器
-        self.test_generator = LLMTestGenerator(self.llm_client)
+        # 初始化LLM测试生成器（传入compile_analyzer用于提取完整的include）
+        self.test_generator = LLMTestGenerator(self.llm_client, compile_analyzer=self.compile_analyzer)
     
     @classmethod
     def from_config(cls, config_file: str, 

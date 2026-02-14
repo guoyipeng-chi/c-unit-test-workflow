@@ -2,14 +2,27 @@
 """
 Compile Commands Analyzer
 解析compile_commands.json，提取编译信息（include路径、宏定义等）
+支持使用libclang进行精确的include依赖分析
 """
 
 import json
 import re
 import os
+import logging
 from dataclasses import dataclass
 from typing import List, Dict, Set, Optional
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# 尝试导入libclang
+try:
+    from clang.cindex import Index, TranslationUnit, conf
+    LIBCLANG_AVAILABLE = True
+    logger.info("libclang is available - will use for precise include analysis")
+except ImportError:
+    LIBCLANG_AVAILABLE = False
+    logger.warning("libclang not available - will use fallback include extraction")
 
 
 @dataclass
@@ -27,7 +40,7 @@ class CompileInfo:
 
 
 class CompileCommandsAnalyzer:
-    """compile_commands.json分析器"""
+    """compile_commands.json分析器，支持libclang进行精确的include分析"""
     
     def __init__(self, compile_commands_file: str):
         """
@@ -40,6 +53,17 @@ class CompileCommandsAnalyzer:
         self.commands: List[Dict] = []
         self.compile_info: Dict[str, CompileInfo] = {}
         self.project_root = os.path.dirname(compile_commands_file)
+        
+        # 初始化libclang（如果可用）
+        self.clang_index = None
+        self.use_clang = LIBCLANG_AVAILABLE
+        if self.use_clang:
+            try:
+                self.clang_index = Index.create()
+                logger.info("✓ libclang initialized successfully")
+            except Exception as e:
+                logger.warning(f"Failed to initialize libclang: {e}")
+                self.use_clang = False
         
         self._load_commands()
     
@@ -62,6 +86,134 @@ class CompileCommandsAnalyzer:
             file = cmd_entry.get("file", "")
             if file:
                 self.compile_info[file] = self._analyze_command(cmd_entry)
+    
+    def extract_all_includes(self, source_file: str, compile_info: Optional[CompileInfo] = None) -> Set[str]:
+        """
+        提取源文件的所有include文件（包括间接依赖）
+        
+        使用libclang进行精确分析，或降级到递归扫描
+        
+        Args:
+            source_file: 源文件路径
+            compile_info: 编译信息（用于获取include目录等）
+            
+        Returns:
+            所有include文件的集合（包括system headers）
+        """
+        if self.use_clang and self.clang_index:
+            return self._extract_includes_with_clang(source_file, compile_info)
+        else:
+            return self._extract_includes_fallback(source_file)
+    
+    def _extract_includes_with_clang(self, source_file: str, compile_info: Optional[CompileInfo]) -> Set[str]:
+        """
+        使用libclang精确提取所有include
+        
+        这是最准确的方法，能处理：
+        - 条件编译 (#ifdef)
+        - 宏展开
+        - 系统headers
+        - 嵌套依赖
+        """
+        includes = set()
+        
+        try:
+            # 构建编译参数
+            compile_args = []
+            
+            if compile_info:
+                # 添加include目录
+                for inc_dir in compile_info.include_dirs:
+                    compile_args.append(f"-I{inc_dir}")
+                
+                # 添加宏定义
+                for name, value in compile_info.defines.items():
+                    if value:
+                        compile_args.append(f"-D{name}={value}")
+                    else:
+                        compile_args.append(f"-D{name}")
+                
+                # 添加C标准
+                if compile_info.c_standard:
+                    if 'c99' in compile_info.c_standard or 'c11' in compile_info.c_standard:
+                        compile_args.append(f"-std={compile_info.c_standard}")
+            
+            # 使用libclang解析
+            tu = self.clang_index.parse(
+                source_file,
+                args=compile_args,
+                options=TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD
+            )
+            
+            # 收集所有include的文件
+            for included_file in tu.get_includes():
+                inc_name = included_file.name
+                if inc_name:
+                    includes.add(inc_name)
+            
+            logger.info(f"✓ Extracted {len(includes)} includes for {os.path.basename(source_file)} using libclang")
+            
+        except Exception as e:
+            logger.warning(f"Failed to extract includes with libclang: {e}")
+            logger.info("Falling back to regex-based extraction")
+            return self._extract_includes_fallback(source_file)
+        
+        return includes
+    
+    def _extract_includes_fallback(self, source_file: str) -> Set[str]:
+        """
+        降级方案：使用正则和递归扫描提取include
+        
+        这是libclang不可用时的fallback方案
+        处理较为简单的场景
+        """
+        includes = set()
+        visited = set()
+        
+        def process_file(filepath: str):
+            """递归处理文件"""
+            if filepath in visited:
+                return
+            visited.add(filepath)
+            
+            try:
+                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                    for line in f:
+                        # 匹配 #include "file.h" 或 #include <file.h>
+                        if match := re.match(r'#include\s+"([^"]+)"|#include\s+<([^>]+)>', line.strip()):
+                            inc_file = match.group(1) or match.group(2)
+                            includes.add(inc_file)
+                            
+                            # 如果是本地include（用双引号），尝试递归处理
+                            if match.group(1):  # 双引号表示本地include
+                                inc_path = self._resolve_include_path(filepath, inc_file)
+                                if inc_path and os.path.exists(inc_path) and inc_path not in visited:
+                                    process_file(inc_path)
+            except Exception as e:
+                logger.debug(f"Error processing file {filepath}: {e}")
+        
+        process_file(source_file)
+        logger.info(f"Extracted {len(includes)} includes for {os.path.basename(source_file)} using fallback method")
+        return includes
+    
+    def _resolve_include_path(self, source_file: str, include_name: str) -> Optional[str]:
+        """
+        解析include文件的完整路径
+        
+        对于本地include（双引号），优先在源文件所在目录查找
+        """
+        # 1. 在源文件所在目录查找
+        source_dir = os.path.dirname(source_file)
+        candidate = os.path.join(source_dir, include_name)
+        if os.path.exists(candidate):
+            return candidate
+        
+        # 2. 在项目根目录查找
+        candidate = os.path.join(self.project_root, include_name)
+        if os.path.exists(candidate):
+            return candidate
+        
+        return None
     
     def _analyze_command(self, cmd_entry: Dict) -> CompileInfo:
         """
