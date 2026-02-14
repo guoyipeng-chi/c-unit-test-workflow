@@ -1,0 +1,81 @@
+{
+  "project": {
+    "name": "Example C Project",
+    "version": "1.0",
+    "description": "Example configuration for UT generation"
+  },
+  
+  "llm": {
+    "api_base": "http://localhost:8000",
+    "model": "qwen2.5-coder-32b",
+    "temperature": 0.7,
+    "max_tokens": 4096,
+    "top_p": 0.95,
+    "timeout": 120
+  },
+  
+  "code_analysis": {
+    "include_patterns": ["*.h"],
+    "source_patterns": ["*.c"],
+    "exclude": [
+      "**/third_party/**",
+      "**/build/**",
+      "**/.git/**"
+    ]
+  },
+  
+  "test_generation": {
+    "framework": "gtest",
+    "output_suffix": "_llm_test.cpp",
+    "include_mocks": true,
+    "coverage_goal": 80,
+    "test_cases_per_function": {
+      "minimum": 5,
+      "recommended": 10
+    }
+  },
+  
+  "compile_commands": {
+    "search_paths": [
+      "./build/compile_commands.json",
+      "./build-ninja-msvc/compile_commands.json",
+      "./cmake-build-debug/compile_commands.json"
+    ]
+  },
+
+  "paths": {
+    "project_root": ".",
+    "project_root_comment": "被测试代码的根路径。支持绝对路径或相对路径（相对于此配置文件）",
+    "examples_project_root": {
+      "current_dir": ".",
+      "relative_dir": "../my-c-project",
+      "absolute_windows": "C:\\Users\\YourName\\my-c-project",
+      "absolute_linux": "/home/user/my-c-project"
+    },
+    
+    "test_output_dir": "test",
+    "test_output_dir_comment": "生成的测试用例存放目录。相对于project_root。如果是绝对路径会直接使用",
+    "examples_test_output": {
+      "default": "test",
+      "unit_tests": "unit_tests",
+      "absolute_windows": "C:\\my-ut-output",
+      "absolute_linux": "/tmp/generated-tests"
+    },
+    
+    "include_dir": "include",
+    "include_dir_comment": "头文件目录。相对于project_root",
+    "examples_include": {
+      "standard": "include",
+      "custom": "headers",
+      "nested": "src/include"
+    },
+    
+    "src_dir": "src",
+    "src_dir_comment": "源文件目录。相对于project_root",
+    "examples_src": {
+      "standard": "src",
+      "algorithms": "lib/algorithms",
+      "multiple": "src"
+    }
+  }
+}

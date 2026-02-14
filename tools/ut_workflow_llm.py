@@ -24,6 +24,9 @@ class LLMUTWorkflow:
     """集成LLM的UT生成工作流"""
     
     def __init__(self, project_dir: str, compile_commands_file: str,
+                 test_output_dir: Optional[str] = None,
+                 include_dir: Optional[str] = None,
+                 src_dir: Optional[str] = None,
                  llm_api_base: Optional[str] = None,
                  llm_model: Optional[str] = None):
         """
@@ -34,13 +37,21 @@ class LLMUTWorkflow:
         Args:
             project_dir: 项目根目录
             compile_commands_file: compile_commands.json路径
+            test_output_dir: 测试输出目录（相对于project_dir，默认'test'）
+            include_dir: 头文件目录（相对于project_dir，默认'include'）
+            src_dir: 源文件目录（相对于project_dir，默认'src'）
             llm_api_base: vLLM API地址（可通过环境变量 VLLM_API_BASE 覆盖）
             llm_model: 模型名称（可通过环境变量 VLLM_MODEL 覆盖）
         """
-        self.project_dir = project_dir
-        self.include_dir = os.path.join(project_dir, 'include')
-        self.src_dir = os.path.join(project_dir, 'src')
-        self.test_dir = os.path.join(project_dir, 'test')
+        self.project_dir = os.path.abspath(project_dir)
+        
+        # 使用提供的目录或默认值
+        self.include_dir = os.path.join(self.project_dir, include_dir or 'include')
+        self.src_dir = os.path.join(self.project_dir, src_dir or 'src')
+        self.test_dir = os.path.join(self.project_dir, test_output_dir or 'test')
+        
+        # 确保输出目录存在
+        os.makedirs(self.test_dir, exist_ok=True)
         
         # 初始化各组件
         self.code_analyzer = CCodeAnalyzer(self.include_dir, self.src_dir)
@@ -59,6 +70,100 @@ class LLMUTWorkflow:
         
         # 初始化LLM测试生成器
         self.test_generator = LLMTestGenerator(self.llm_client)
+    
+    @classmethod
+    def from_config(cls, config_file: str, 
+                   project_root_override: Optional[str] = None,
+                   compile_commands_override: Optional[str] = None) -> 'LLMUTWorkflow':
+        """
+        从配置文件创建工作流实例
+        
+        Args:
+            config_file: llm_workflow_config.json 路径
+            project_root_override: 覆盖配置文件中的项目根路径
+            compile_commands_override: 覆盖compile_commands.json的搜索位置
+            
+        Returns:
+            LLMUTWorkflow 实例
+            
+        示例:
+            # 使用配置文件
+            workflow = LLMUTWorkflow.from_config('llm_workflow_config.json')
+            
+            # 覆盖某些配置
+            workflow = LLMUTWorkflow.from_config(
+                'llm_workflow_config.json',
+                project_root_override='/path/to/my-project'
+            )
+        """
+        config_path = Path(config_file).absolute()
+        config_dir = config_path.parent
+        
+        # 加载配置文件
+        with open(config_path) as f:
+            config = json.load(f)
+        
+        # 获取路径配置
+        paths_config = config.get('paths', {})
+        
+        # 确定项目根目录
+        project_root = project_root_override
+        if not project_root:
+            project_root = paths_config.get('project_root', '.')
+            # 如果是相对路径，相对于配置文件所在目录
+            if not os.path.isabs(project_root):
+                project_root = os.path.join(config_dir, project_root)
+        
+        project_root = os.path.abspath(project_root)
+        
+        # 获取其他路径配置
+        test_output_dir = paths_config.get('test_output_dir', 'test')
+        include_dir = paths_config.get('include_dir', 'include')
+        src_dir = paths_config.get('src_dir', 'src')
+        
+        # 确定compile_commands.json位置
+        if compile_commands_override:
+            compile_commands_file = compile_commands_override
+        else:
+            compile_commands_paths = config.get('compile_commands', {}).get('search_paths', [])
+            compile_commands_file = None
+            
+            for search_path in compile_commands_paths:
+                # 如果是相对路径，相对于项目根目录
+                if not os.path.isabs(search_path):
+                    full_path = os.path.join(project_root, search_path)
+                else:
+                    full_path = search_path
+                
+                if os.path.exists(full_path):
+                    compile_commands_file = full_path
+                    break
+            
+            if not compile_commands_file:
+                raise FileNotFoundError(
+                    f"Cannot find compile_commands.json in search paths: {compile_commands_paths}\n"
+                    f"Project root: {project_root}"
+                )
+        
+        # 获取LLM配置
+        llm_config = config.get('llm', {})
+        llm_api_base = llm_config.get('api_base', 'http://localhost:8000')
+        llm_model = llm_config.get('model', 'qwen-coder')
+        
+        print(f"[Config] Loading from: {config_path}")
+        print(f"[Config] Project root: {project_root}")
+        print(f"[Config] Compile commands: {compile_commands_file}")
+        print(f"[Config] Test output dir: {test_output_dir}")
+        
+        return cls(
+            project_dir=project_root,
+            compile_commands_file=compile_commands_file,
+            test_output_dir=test_output_dir,
+            include_dir=include_dir,
+            src_dir=src_dir,
+            llm_api_base=llm_api_base,
+            llm_model=llm_model
+        )
     
     def analyze_codebase(self) -> None:
         """分析代码库"""
@@ -265,15 +370,20 @@ def main():
     )
     
     parser.add_argument(
+        "--config",
+        help="Load from configuration file (llm_workflow_config.json)"
+    )
+    
+    parser.add_argument(
         "--project-dir",
         default=".",
-        help="Project root directory"
+        help="Project root directory (覆盖config中的设置)"
     )
     
     parser.add_argument(
         "--compile-commands",
         default="build/compile_commands.json",
-        help="Path to compile_commands.json"
+        help="Path to compile_commands.json (覆盖config中的设置)"
     )
     
     parser.add_argument(
@@ -314,23 +424,36 @@ def main():
     
     args = parser.parse_args()
     
-    # 检查文件存在
-    if not os.path.exists(args.compile_commands):
-        print(f"✗ compile_commands.json not found: {args.compile_commands}")
-        print("  Please run: cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON <project_root>")
-        sys.exit(1)
-    
-    # 创建工作流
-    try:
-        workflow = LLMUTWorkflow(
-            project_dir=args.project_dir,
-            compile_commands_file=args.compile_commands,
-            llm_api_base=args.llm_api,
-            llm_model=args.llm_model
-        )
-    except Exception as e:
-        print(f"✗ Failed to initialize workflow: {e}")
-        sys.exit(1)
+    # 优先从配置文件加载
+    if args.config:
+        try:
+            print(f"[Config] Loading from: {args.config}")
+            workflow = LLMUTWorkflow.from_config(
+                args.config,
+                project_root_override=args.project_dir if args.project_dir != "." else None,
+                compile_commands_override=args.compile_commands if args.compile_commands != "build/compile_commands.json" else None
+            )
+        except Exception as e:
+            print(f"✗ Failed to load config: {e}")
+            sys.exit(1)
+    else:
+        # 检查文件存在
+        if not os.path.exists(args.compile_commands):
+            print(f"✗ compile_commands.json not found: {args.compile_commands}")
+            print("  Please run: cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON <project_root>")
+            sys.exit(1)
+        
+        # 创建工作流
+        try:
+            workflow = LLMUTWorkflow(
+                project_dir=args.project_dir,
+                compile_commands_file=args.compile_commands,
+                llm_api_base=args.llm_api,
+                llm_model=args.llm_model
+            )
+        except Exception as e:
+            print(f"✗ Failed to initialize workflow: {e}")
+            sys.exit(1)
     
     if args.info_only:
         workflow.show_workflow_info()
