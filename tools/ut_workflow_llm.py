@@ -9,6 +9,7 @@ import os
 import argparse
 import json
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -320,6 +321,10 @@ class LLMUTWorkflow:
         
         if test_dir is None:
             test_dir = self.test_dir
+
+        log_dir = os.path.join(self.project_dir, "log")
+        os.makedirs(log_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         test_files = [f for f in os.listdir(test_dir) if f.endswith('_llm_test.cpp')]
         
@@ -423,6 +428,15 @@ class LLMUTWorkflow:
                                 print(f"    {line}")
                         if len(compile_result.stderr.split('\n')) > 5:
                             print(f"    ... (more errors)")
+                    log_path = os.path.join(log_dir, f"{test_name}_compile_{timestamp}.log")
+                    with open(log_path, 'w', encoding='utf-8') as log_file:
+                        log_file.write("Compile command:\n")
+                        log_file.write(" ".join(compile_cmd) + "\n\n")
+                        log_file.write("STDOUT:\n")
+                        log_file.write(compile_result.stdout or "")
+                        log_file.write("\nSTDERR:\n")
+                        log_file.write(compile_result.stderr or "")
+                    print(f"  ↳ Compile log saved: {log_path}")
                     all_passed = False
                     results.append((test_name, "COMPILE_FAILED"))
                     continue
@@ -460,15 +474,34 @@ class LLMUTWorkflow:
                         for line in error_lines:
                             if 'FAILED' in line or 'ERROR' in line or 'failed' in line:
                                 print(f"    {line.strip()}")
+                    log_path = os.path.join(log_dir, f"{test_name}_run_{timestamp}.log")
+                    with open(log_path, 'w', encoding='utf-8') as log_file:
+                        log_file.write("Command:\n")
+                        log_file.write(exe_path + "\n\n")
+                        log_file.write("STDOUT:\n")
+                        log_file.write(run_result.stdout or "")
+                        log_file.write("\nSTDERR:\n")
+                        log_file.write(run_result.stderr or "")
+                    print(f"  ↳ Run log saved: {log_path}")
             
             except subprocess.TimeoutExpired:
                 print(f"  ✗ Test execution timeout")
                 results.append((test_name, "TIMEOUT"))
                 all_passed = False
+                log_path = os.path.join(log_dir, f"{test_name}_timeout_{timestamp}.log")
+                with open(log_path, 'w', encoding='utf-8') as log_file:
+                    log_file.write("Test execution timed out.\n")
+                    log_file.write(f"Executable: {exe_path}\n")
+                print(f"  ↳ Timeout log saved: {log_path}")
             except Exception as e:
                 print(f"  ✗ Error: {e}")
                 results.append((test_name, "ERROR"))
                 all_passed = False
+                log_path = os.path.join(log_dir, f"{test_name}_error_{timestamp}.log")
+                with open(log_path, 'w', encoding='utf-8') as log_file:
+                    log_file.write("Unexpected error during test execution.\n")
+                    log_file.write(str(e) + "\n")
+                print(f"  ↳ Error log saved: {log_path}")
         
         # 显示总结
         print("\n" + "=" * 60)
