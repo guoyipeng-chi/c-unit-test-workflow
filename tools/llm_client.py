@@ -75,7 +75,10 @@ class VLLMClient:
                 max_tokens: int = 4096,
                 top_p: float = 0.95) -> str:
         """
-        调用vLLM生成文本
+        调用vLLM生成文本（使用Chat API生成独立的代码片段）
+        
+        使用 /v1/chat/completions 而不是 /v1/completions
+        这样生成的是独立的代码片段，而不是文本续写
         
         Args:
             prompt: 输入提示
@@ -86,15 +89,25 @@ class VLLMClient:
         Returns:
             生成的文本
         """
-        url = f"{self.api_base}/v1/completions"
+        # 使用Chat API而不是completions API
+        # completions API会进行文本续写
+        # chat/completions API能更好地理解指令并生成独立的代码
+        url = f"{self.api_base}/v1/chat/completions"
+        
+        # 构建消息格式（Chat API所需）
+        messages = [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
         
         payload = {
             "model": self.model,
-            "prompt": prompt,
+            "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "top_p": top_p,
-            "stop": ["<|end_header_id|>", "```"],
         }
         
         headers = {
@@ -103,7 +116,7 @@ class VLLMClient:
         }
         
         try:
-            logger.info(f"Calling vLLM... (max_tokens={max_tokens})")
+            logger.info(f"Calling vLLM chat/completions... (max_tokens={max_tokens})")
             response = requests.post(
                 url,
                 json=payload,
@@ -114,7 +127,8 @@ class VLLMClient:
             if response.status_code == 200:
                 result = response.json()
                 if result.get("choices") and len(result["choices"]) > 0:
-                    generated_text = result["choices"][0].get("text", "")
+                    # Chat API返回的是message.content而不是text
+                    generated_text = result["choices"][0]["message"].get("content", "")
                     logger.info(f"✓ Generated {len(generated_text)} chars")
                     return generated_text
             else:
@@ -131,16 +145,17 @@ class VLLMClient:
                      temperature: float = 0.7,
                      max_tokens: int = 4096) -> str:
         """
-        调用Chat API (如果服务支持)
+        调用Chat API - 已被generate()方法使用
         
         Args:
-            messages: 消息列表 [{"role": "user", "content": "..."}, ...]
+            messages: 消息列表 [{'role': 'user', 'content': '...'}, ...]
             temperature: 温度参数
             max_tokens: 最大生成token数
             
         Returns:
             生成的响应
         """
+        # 注意: generate()方法现在也使用此Chat API
         url = f"{self.api_base}/v1/chat/completions"
         
         payload = {
@@ -179,14 +194,16 @@ class VLLMClient:
         return ""
 
 
-def create_client(api_base: str = "http://localhost:8000",
-                 model: str = "qwen-coder") -> VLLMClient:
+def create_client(api_base: Optional[str] = None,
+                 model: Optional[str] = None) -> VLLMClient:
     """
     工厂函数：创建vLLM客户端
     
+    优先级: 环境变量 > 参数 > 默认值
+    
     Args:
-        api_base: vLLM服务地址
-        model: 模型名称
+        api_base: vLLM服务地址（可通过环境变量VLLM_API_BASE覆盖）
+        model: 模型名称（可通过环境变量VLLM_MODEL覆盖）
         
     Returns:
         VLLMClient实例
