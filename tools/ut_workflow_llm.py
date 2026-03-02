@@ -244,6 +244,34 @@ class LLMUTWorkflow:
         if len(diff_lines) > max_lines:
             preview += "\n..."
         return preview
+
+    @staticmethod
+    def _normalize_issue_text(text: str) -> str:
+        normalized = re.sub(r'\s+', ' ', (text or '').strip().lower())
+        return normalized[:240]
+
+    @classmethod
+    def _build_issue_fingerprint(cls,
+                                 error_type: str,
+                                 root_cause: str,
+                                 key_symbols: Optional[List[str]] = None,
+                                 raw_output: str = "") -> str:
+        key_symbols = key_symbols or []
+        etype = cls._normalize_issue_text(error_type or "unknown")
+        cause = cls._normalize_issue_text(root_cause or "")
+        if not cause:
+            raw_lines = []
+            for line in (raw_output or "").splitlines():
+                stripped = line.strip()
+                if stripped:
+                    raw_lines.append(stripped)
+                if len(raw_lines) >= 4:
+                    break
+            cause = cls._normalize_issue_text(" | ".join(raw_lines))
+
+        symbols = sorted({str(s).strip().lower() for s in key_symbols if str(s).strip()})
+        symbols_sig = ",".join(symbols[:6])
+        return f"{etype}|{cause}|{symbols_sig}"
     
     def analyze_codebase(self) -> None:
         """分析代码库"""
@@ -1050,6 +1078,8 @@ class LLMUTWorkflow:
                 runtime_fix_count = 0
                 compile_round = 0
                 max_compile_rounds = max_fix_attempts + 2
+                compile_seen_issue_fingerprints = set()
+                runtime_seen_issue_fingerprints = set()
                 test_finished = False
 
                 while not test_finished:
@@ -1115,7 +1145,7 @@ class LLMUTWorkflow:
                             print("    Skipping LLM code-fix because this is not a test code issue.")
                             break
 
-                        if (not auto_fix_compile_errors) or llm_fix_count >= max_fix_attempts:
+                        if not auto_fix_compile_errors:
                             break
 
                         triage_result = {
@@ -1223,6 +1253,32 @@ class LLMUTWorkflow:
                             except Exception as triage_error:
                                 print(f"  ⚠ Triage failed, fallback to direct fix: {triage_error}")
 
+                        compile_output = (compile_result.stderr or compile_result.stdout or "")
+                        issue_fingerprint = self._build_issue_fingerprint(
+                            error_type=str(triage_result.get("error_type", "unknown")),
+                            root_cause=str(triage_result.get("root_cause", "")),
+                            key_symbols=triage_result.get("key_symbols", []),
+                            raw_output=compile_output
+                        )
+                        is_new_issue = issue_fingerprint not in compile_seen_issue_fingerprints
+                        triage_result["issue_fingerprint"] = issue_fingerprint
+                        triage_result["is_new_issue"] = bool(is_new_issue)
+
+                        if llm_fix_count >= max_fix_attempts:
+                            if is_new_issue:
+                                print(
+                                    "  [RetryPolicy] New compile issue detected after retry budget; "
+                                    "allowing extra fix round."
+                                )
+                            else:
+                                print(
+                                    "  [RetryPolicy] Compile retry budget reached and issue repeated; "
+                                    "stopping auto-fix."
+                                )
+                                break
+
+                        compile_seen_issue_fingerprints.add(issue_fingerprint)
+
                         print(f"  [Fix] Entering auto-fix phase ({llm_fix_count + 1}/{max_fix_attempts})...")
                         try:
                             with open(test_path, 'r', encoding='utf-8') as f:
@@ -1231,7 +1287,7 @@ class LLMUTWorkflow:
 
                             fixed_test_code = self.test_generator.fix_test_from_compile_error(
                                 current_test_code=current_test_code,
-                                compile_error=(compile_result.stderr or compile_result.stdout or ""),
+                                compile_error=compile_output,
                                 function_name=test_name.replace("_llm_test", ""),
                                 compile_analysis=triage_result if llm_triage_enabled else None
                             )
@@ -1323,7 +1379,7 @@ class LLMUTWorkflow:
                         log_file.write(run_result.stderr or "")
                     print(f"  ↳ Run log saved: {run_log_path}")
 
-                    if (not auto_fix_test_failures) or runtime_fix_count >= max_test_fix_attempts:
+                    if not auto_fix_test_failures:
                         results.append((test_name, "FAILED"))
                         all_passed = False
                         test_finished = True
@@ -1436,6 +1492,34 @@ class LLMUTWorkflow:
                                 continue
                         except Exception as triage_error:
                             print(f"  ⚠ Runtime triage failed, fallback to direct fix: {triage_error}")
+
+                    runtime_issue_fingerprint = self._build_issue_fingerprint(
+                        error_type=str(runtime_triage_result.get("error_type", "unknown")),
+                        root_cause=str(runtime_triage_result.get("root_cause", "")),
+                        key_symbols=runtime_triage_result.get("key_symbols", []),
+                        raw_output=run_output
+                    )
+                    runtime_is_new_issue = runtime_issue_fingerprint not in runtime_seen_issue_fingerprints
+                    runtime_triage_result["issue_fingerprint"] = runtime_issue_fingerprint
+                    runtime_triage_result["is_new_issue"] = bool(runtime_is_new_issue)
+
+                    if runtime_fix_count >= max_test_fix_attempts:
+                        if runtime_is_new_issue:
+                            print(
+                                "  [RetryPolicy] New runtime issue detected after retry budget; "
+                                "allowing extra fix round."
+                            )
+                        else:
+                            print(
+                                "  [RetryPolicy] Runtime retry budget reached and issue repeated; "
+                                "stopping auto-fix."
+                            )
+                            results.append((test_name, "FAILED"))
+                            all_passed = False
+                            test_finished = True
+                            continue
+
+                    runtime_seen_issue_fingerprints.add(runtime_issue_fingerprint)
 
                     print(
                         f"  [Fix] Entering runtime auto-fix phase ({runtime_fix_count + 1}/{max_test_fix_attempts})..."
