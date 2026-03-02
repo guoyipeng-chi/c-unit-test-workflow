@@ -302,7 +302,9 @@ Then verify with:
     def run_workflow(self, functions: Optional[list] = None,
                      analyze_only: bool = False,
                      max_fix_attempts: Optional[int] = None,
-                     auto_fix_compile_errors: Optional[bool] = None) -> bool:
+                     auto_fix_compile_errors: Optional[bool] = None,
+                     llm_triage_enabled: Optional[bool] = None,
+                     triage_min_confidence: Optional[float] = None) -> bool:
         """运行工作流"""
         print("\n[Run] Starting LLM UT Generation Workflow...")
         print("=" * 60)
@@ -351,6 +353,23 @@ Then verify with:
         if not effective_auto_fix:
             cmd.append("--no-auto-fix-compile")
         cmd.extend(["--max-fix-attempts", str(effective_max_fix_attempts)])
+
+        effective_llm_triage_enabled = compile_fix_cfg.get("llm_triage_enabled", True)
+        if llm_triage_enabled is not None:
+            effective_llm_triage_enabled = llm_triage_enabled
+
+        effective_triage_min_conf = compile_fix_cfg.get("triage_min_confidence", 0.55)
+        try:
+            effective_triage_min_conf = float(effective_triage_min_conf)
+        except (TypeError, ValueError):
+            effective_triage_min_conf = 0.55
+        if triage_min_confidence is not None:
+            effective_triage_min_conf = triage_min_confidence
+        effective_triage_min_conf = max(0.0, min(1.0, effective_triage_min_conf))
+
+        if not effective_llm_triage_enabled:
+            cmd.append("--disable-llm-triage")
+        cmd.extend(["--triage-min-confidence", f"{effective_triage_min_conf:.2f}"])
 
         # 从配置透传LLM后端与Ollama设置到子进程环境
         env = os.environ.copy()
@@ -410,7 +429,9 @@ Enter your choice (1-7):
     
     def interactive_mode(self,
                          max_fix_attempts: Optional[int] = None,
-                         auto_fix_compile_errors: Optional[bool] = None) -> None:
+                         auto_fix_compile_errors: Optional[bool] = None,
+                         llm_triage_enabled: Optional[bool] = None,
+                         triage_min_confidence: Optional[float] = None) -> None:
         """交互模式"""
         while True:
             self.show_menu()
@@ -430,7 +451,9 @@ Enter your choice (1-7):
                 self.run_workflow(
                     analyze_only=True,
                     max_fix_attempts=max_fix_attempts,
-                    auto_fix_compile_errors=auto_fix_compile_errors
+                    auto_fix_compile_errors=auto_fix_compile_errors,
+                    llm_triage_enabled=llm_triage_enabled,
+                    triage_min_confidence=triage_min_confidence
                 )
             elif choice == "5":
                 if not self.check_environment(prompt_install_compiler=True):
@@ -441,7 +464,9 @@ Enter your choice (1-7):
                 self.run_workflow(
                     functions=func_list,
                     max_fix_attempts=max_fix_attempts,
-                    auto_fix_compile_errors=auto_fix_compile_errors
+                    auto_fix_compile_errors=auto_fix_compile_errors,
+                    llm_triage_enabled=llm_triage_enabled,
+                    triage_min_confidence=triage_min_confidence
                 )
             elif choice == "6":
                 if not self.check_environment(prompt_install_compiler=True):
@@ -453,7 +478,9 @@ Enter your choice (1-7):
                         continue
                 self.run_workflow(
                     max_fix_attempts=max_fix_attempts,
-                    auto_fix_compile_errors=auto_fix_compile_errors
+                    auto_fix_compile_errors=auto_fix_compile_errors,
+                    llm_triage_enabled=llm_triage_enabled,
+                    triage_min_confidence=triage_min_confidence
                 )
             elif choice == "7":
                 print("Goodbye!")
@@ -523,6 +550,19 @@ def main():
         action="store_true",
         help="Disable compile auto-fix phase in quickstart"
     )
+
+    parser.add_argument(
+        "--disable-llm-triage",
+        action="store_true",
+        help="Disable analyze-then-fix triage before LLM patch"
+    )
+
+    parser.add_argument(
+        "--triage-min-confidence",
+        type=float,
+        default=None,
+        help="Minimum triage confidence [0,1] required to apply LLM fix"
+    )
     
     args = parser.parse_args()
     
@@ -540,7 +580,9 @@ def main():
     if args.interactive or not action_requested:
         quickstart.interactive_mode(
             max_fix_attempts=args.max_fix_attempts,
-            auto_fix_compile_errors=(False if args.no_auto_fix_compile else None)
+            auto_fix_compile_errors=(False if args.no_auto_fix_compile else None),
+            llm_triage_enabled=(False if args.disable_llm_triage else None),
+            triage_min_confidence=args.triage_min_confidence
         )
     
     # 命令行模式
@@ -567,7 +609,9 @@ def main():
         if quickstart.run_workflow(
             analyze_only=True,
             max_fix_attempts=args.max_fix_attempts,
-            auto_fix_compile_errors=(False if args.no_auto_fix_compile else None)
+            auto_fix_compile_errors=(False if args.no_auto_fix_compile else None),
+            llm_triage_enabled=(False if args.disable_llm_triage else None),
+            triage_min_confidence=args.triage_min_confidence
         ):
             sys.exit(0)
         else:
@@ -580,7 +624,9 @@ def main():
         if quickstart.run_workflow(
             functions=functions,
             max_fix_attempts=args.max_fix_attempts,
-            auto_fix_compile_errors=(False if args.no_auto_fix_compile else None)
+            auto_fix_compile_errors=(False if args.no_auto_fix_compile else None),
+            llm_triage_enabled=(False if args.disable_llm_triage else None),
+            triage_min_confidence=args.triage_min_confidence
         ):
             sys.exit(0)
         else:

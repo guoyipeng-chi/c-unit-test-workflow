@@ -55,7 +55,9 @@
     "compile_fix": {
       "auto_fix_compile_errors": true,
       "max_fix_attempts": 2,
-      "comment": "quickstart透传到ut_workflow_llm.py：编译失败后是否自动修复，以及最大修复次数"
+      "llm_triage_enabled": true,
+      "triage_min_confidence": 0.55,
+      "comment": "quickstart/ut_workflow透传：编译失败后是否自动修复、最大修复次数、是否先LLM诊断再修复、修复最低置信度阈值"
     },
     "test_cases_per_function": {
       "minimum": 5,

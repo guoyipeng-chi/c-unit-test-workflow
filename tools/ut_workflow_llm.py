@@ -850,7 +850,9 @@ class LLMUTWorkflow:
     def run_tests(self, test_dir: Optional[str] = None,
                   build_dir: str = "build-test",
                   auto_fix_compile_errors: bool = True,
-                  max_fix_attempts: int = 2) -> bool:
+                  max_fix_attempts: int = 2,
+                  llm_triage_enabled: bool = True,
+                  triage_min_confidence: float = 0.55) -> bool:
         """
         编译并执行生成的测试用例
         
@@ -859,6 +861,8 @@ class LLMUTWorkflow:
             build_dir: 测试编译目录
             auto_fix_compile_errors: 编译失败后是否自动进入LLM修复阶段
             max_fix_attempts: 最大自动修复重试次数
+            llm_triage_enabled: 是否启用“先分析再修复”诊断阶段
+            triage_min_confidence: 触发修复的最低诊断置信度
             
         Returns:
             是否执行成功
@@ -1046,6 +1050,53 @@ class LLMUTWorkflow:
                     if (not auto_fix_compile_errors) or llm_fix_count >= max_fix_attempts:
                         break
 
+                    triage_result = {
+                        "error_type": "unknown",
+                        "root_cause": "triage_skipped",
+                        "should_fix": True,
+                        "confidence": 1.0,
+                        "fix_strategy": ["direct_fix"],
+                        "key_symbols": [],
+                        "minimal_change": "apply minimal compile fix"
+                    }
+
+                    if llm_triage_enabled:
+                        try:
+                            with open(test_path, 'r', encoding='utf-8') as f:
+                                current_test_code = f.read()
+
+                            triage_result = self.test_generator.analyze_compile_error(
+                                current_test_code=current_test_code,
+                                compile_error=(compile_result.stderr or compile_result.stdout or ""),
+                                function_name=test_name.replace("_llm_test", "")
+                            )
+
+                            triage_conf = float(triage_result.get("confidence", 0.0) or 0.0)
+                            triage_type = str(triage_result.get("error_type", "unknown"))
+                            triage_cause = str(triage_result.get("root_cause", ""))
+                            print(
+                                f"  [Triage] type={triage_type}, confidence={triage_conf:.2f}, cause={triage_cause}"
+                            )
+
+                            triage_log_path = os.path.join(
+                                log_dir,
+                                f"{test_name}_triage_attempt{llm_fix_count + 1}_{timestamp}.log"
+                            )
+                            with open(triage_log_path, 'w', encoding='utf-8') as triage_log:
+                                triage_log.write("LLM triage result:\n")
+                                triage_log.write(json.dumps(triage_result, ensure_ascii=False, indent=2))
+                            print(f"  ↳ Triage log saved: {triage_log_path}")
+
+                            if (not bool(triage_result.get("should_fix", True))) or triage_conf < triage_min_confidence:
+                                print(
+                                    f"  ⚠ Triage decided to skip fix "
+                                    f"(should_fix={bool(triage_result.get('should_fix', True))}, "
+                                    f"confidence={triage_conf:.2f} < {triage_min_confidence:.2f})"
+                                )
+                                break
+                        except Exception as triage_error:
+                            print(f"  ⚠ Triage failed, fallback to direct fix: {triage_error}")
+
                     # 进入查错修复阶段
                     print(f"  [Fix] Entering auto-fix phase ({llm_fix_count + 1}/{max_fix_attempts})...")
                     try:
@@ -1055,7 +1106,8 @@ class LLMUTWorkflow:
                         fixed_test_code = self.test_generator.fix_test_from_compile_error(
                             current_test_code=current_test_code,
                             compile_error=(compile_result.stderr or compile_result.stdout or ""),
-                            function_name=test_name.replace("_llm_test", "")
+                            function_name=test_name.replace("_llm_test", ""),
+                            compile_analysis=triage_result if llm_triage_enabled else None
                         )
 
                         with open(test_path, 'w', encoding='utf-8') as f:
@@ -1187,6 +1239,8 @@ Usage:
                           skip_run: bool = False,
                           auto_fix_compile_errors: bool = True,
                           max_fix_attempts: int = 2,
+                          llm_triage_enabled: bool = True,
+                          triage_min_confidence: float = 0.55,
                           skip_quality_gates: bool = False,
                           quality_strict: bool = False) -> None:
         """
@@ -1197,6 +1251,8 @@ Usage:
             skip_run: 是否跳过测试执行步骤
             auto_fix_compile_errors: 编译失败后是否自动进入LLM修复阶段
             max_fix_attempts: 最大自动修复重试次数
+            llm_triage_enabled: 是否启用“先分析再修复”诊断阶段
+            triage_min_confidence: 诊断最低置信度阈值
             skip_quality_gates: 是否跳过clang-format/clang-tidy/cppcheck质量闸门
             quality_strict: 质量闸门严格模式（有问题即停止）
         """
@@ -1224,7 +1280,9 @@ Usage:
         if not skip_run:
             self.run_tests(
                 auto_fix_compile_errors=auto_fix_compile_errors,
-                max_fix_attempts=max_fix_attempts
+                max_fix_attempts=max_fix_attempts,
+                llm_triage_enabled=llm_triage_enabled,
+                triage_min_confidence=triage_min_confidence
             )
         
         print("\n" + "=" * 60)
@@ -1337,6 +1395,19 @@ def main():
     )
 
     parser.add_argument(
+        "--disable-llm-triage",
+        action="store_true",
+        help="Disable analyze-then-fix triage stage before LLM patching"
+    )
+
+    parser.add_argument(
+        "--triage-min-confidence",
+        type=float,
+        default=None,
+        help="Minimum triage confidence [0.0,1.0] required to run LLM fix"
+    )
+
+    parser.add_argument(
         "--skip-quality-gates",
         action="store_true",
         help="Skip quality gates (clang-format / clang-tidy / cppcheck)"
@@ -1352,6 +1423,10 @@ def main():
 
     effective_skip_quality_gates = args.skip_quality_gates
     effective_quality_strict = args.quality_strict
+    effective_max_fix_attempts = max(0, args.max_fix_attempts)
+    effective_auto_fix_compile = not args.no_auto_fix_compile
+    effective_llm_triage_enabled = not args.disable_llm_triage
+    effective_triage_min_conf = args.triage_min_confidence if args.triage_min_confidence is not None else 0.55
     
     # 优先从配置文件加载
     if args.config:
@@ -1367,10 +1442,26 @@ def main():
             with open(args.config, 'r', encoding='utf-8') as f:
                 cfg = json.load(f)
             quality_cfg = cfg.get('test_generation', {}).get('quality_gates', {})
+            compile_fix_cfg = cfg.get('test_generation', {}).get('compile_fix', {})
             if not args.skip_quality_gates and quality_cfg.get('enabled') is False:
                 effective_skip_quality_gates = True
             if not args.quality_strict and quality_cfg.get('strict') is True:
                 effective_quality_strict = True
+
+            if args.max_fix_attempts == 2:
+                try:
+                    effective_max_fix_attempts = max(0, int(compile_fix_cfg.get('max_fix_attempts', 2)))
+                except (TypeError, ValueError):
+                    effective_max_fix_attempts = 2
+            if not args.no_auto_fix_compile and compile_fix_cfg.get('auto_fix_compile_errors') is False:
+                effective_auto_fix_compile = False
+            if not args.disable_llm_triage and compile_fix_cfg.get('llm_triage_enabled') is False:
+                effective_llm_triage_enabled = False
+            if args.triage_min_confidence is None:
+                try:
+                    effective_triage_min_conf = float(compile_fix_cfg.get('triage_min_confidence', 0.55))
+                except (TypeError, ValueError):
+                    effective_triage_min_conf = 0.55
         except Exception as e:
             print(f"✗ Failed to load config: {e}")
             sys.exit(1)
@@ -1402,8 +1493,10 @@ def main():
         workflow.run_full_workflow(
             target_functions=args.functions,
             skip_run=args.skip_run,
-            auto_fix_compile_errors=not args.no_auto_fix_compile,
-            max_fix_attempts=max(0, args.max_fix_attempts),
+            auto_fix_compile_errors=effective_auto_fix_compile,
+            max_fix_attempts=effective_max_fix_attempts,
+            llm_triage_enabled=effective_llm_triage_enabled,
+            triage_min_confidence=max(0.0, min(1.0, effective_triage_min_conf)),
             skip_quality_gates=effective_skip_quality_gates,
             quality_strict=effective_quality_strict
         )

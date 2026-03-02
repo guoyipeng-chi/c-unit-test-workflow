@@ -9,7 +9,7 @@ import json
 import logging
 import os
 import re
-from typing import Optional, Dict, List, Set
+from typing import Optional, Dict, List, Set, Any
 from dataclasses import dataclass
 from llm_client import VLLMClient
 from c_code_analyzer import FunctionDependency
@@ -297,7 +297,8 @@ Return ONLY the C++ code, no markdown wrappers."""
     def fix_test_from_compile_error(self,
                                     current_test_code: str,
                                     compile_error: str,
-                                    function_name: str = "unknown") -> str:
+                                    function_name: str = "unknown",
+                                    compile_analysis: Optional[Dict[str, Any]] = None) -> str:
         """
         根据编译错误修复测试代码
 
@@ -334,6 +335,17 @@ Target Function: {function_name}
 ```
 """
 
+        if compile_analysis:
+            prompt += f"""
+
+=== DIAGNOSTIC ANALYSIS (from previous triage step) ===
+```json
+{json.dumps(compile_analysis, ensure_ascii=False, indent=2)}
+```
+
+Use this analysis as primary guidance and perform minimal, targeted changes.
+"""
+
         logger.info(f"Fixing test code from compile error for {function_name}...")
         response = self.llm.generate(
             prompt,
@@ -357,6 +369,119 @@ Target Function: {function_name}
         fixed_code = self._sanitize_generated_test_code(fixed_code, forbidden_symbols=forbidden_symbols)
 
         return fixed_code
+
+    @staticmethod
+    def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+        """从模型响应中提取首个JSON对象。"""
+        if not text:
+            return None
+
+        raw = text.strip()
+        if raw.startswith("```"):
+            lines = raw.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            raw = "\n".join(lines).strip()
+
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                parsed = json.loads(raw[start:end + 1])
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                return None
+
+        return None
+
+    def analyze_compile_error(self,
+                              current_test_code: str,
+                              compile_error: str,
+                              function_name: str = "unknown") -> Dict[str, Any]:
+        """先诊断编译错误，返回结构化分析结果。"""
+        prompt = f"""You are a senior C/C++ build and test debugging assistant.
+Analyze the compile/link errors and return a STRICT JSON object only.
+
+Output schema (all fields required):
+{{
+  "error_type": "toolchain|linker|signature|include|mock|syntax|logic|unknown",
+  "root_cause": "short cause summary",
+  "should_fix": true,
+  "confidence": 0.0,
+  "fix_strategy": ["ordered actionable steps"],
+  "key_symbols": ["symbol1", "symbol2"],
+  "minimal_change": "short patch guidance"
+}}
+
+Rules:
+- confidence is a float in [0,1]
+- Prefer minimal edits and preserving test intent
+- Do NOT include markdown, comments, or extra text
+
+Target Function: {function_name}
+
+=== CURRENT TEST CODE ===
+```cpp
+{current_test_code}
+```
+
+=== COMPILER ERRORS ===
+```
+{compile_error}
+```
+"""
+
+        logger.info(f"Triaging compile error for {function_name}...")
+        response = self.llm.generate(
+            prompt,
+            temperature=0.1,
+            max_tokens=1024,
+            top_p=0.9
+        )
+
+        default_result: Dict[str, Any] = {
+            "error_type": "unknown",
+            "root_cause": "triage_unavailable",
+            "should_fix": True,
+            "confidence": 0.0,
+            "fix_strategy": ["fallback_to_direct_fix"],
+            "key_symbols": [],
+            "minimal_change": "apply minimal compile fix"
+        }
+
+        if not response:
+            return default_result
+
+        parsed = self._extract_json_object(response)
+        if not parsed:
+            return default_result
+
+        result = default_result.copy()
+        result.update(parsed)
+
+        try:
+            result["confidence"] = float(result.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            result["confidence"] = 0.0
+        result["confidence"] = max(0.0, min(1.0, result["confidence"]))
+        result["should_fix"] = bool(result.get("should_fix", True))
+
+        if not isinstance(result.get("fix_strategy"), list):
+            result["fix_strategy"] = [str(result.get("fix_strategy", "fallback_to_direct_fix"))]
+        if not isinstance(result.get("key_symbols"), list):
+            result["key_symbols"] = []
+
+        return result
     
     def _generate_fallback_test(self, func_dep: FunctionDependency) -> str:
         """生成备选测试代码"""
