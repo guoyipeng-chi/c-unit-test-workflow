@@ -18,7 +18,7 @@
     "model": "qwen-coder",
     "model_comment": "vLLM模型名（仅backend=vllm或auto命中vllm时使用）",
     "temperature": 0.7,
-    "max_tokens": 4096,
+    "max_tokens": 64000,
     "top_p": 0.95,
     "timeout": 120,
 
@@ -51,6 +51,11 @@
       "enabled": true,
       "strict": false,
       "tools": ["clang-format", "clang-tidy", "cppcheck"]
+    },
+    "compile_fix": {
+      "auto_fix_compile_errors": true,
+      "max_fix_attempts": 2,
+      "comment": "quickstart透传到ut_workflow_llm.py：编译失败后是否自动修复，以及最大修复次数"
     },
     "test_cases_per_function": {
       "minimum": 5,

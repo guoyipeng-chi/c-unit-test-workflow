@@ -300,7 +300,9 @@ Then verify with:
             return False
     
     def run_workflow(self, functions: Optional[list] = None,
-                     analyze_only: bool = False) -> bool:
+                     analyze_only: bool = False,
+                     max_fix_attempts: Optional[int] = None,
+                     auto_fix_compile_errors: Optional[bool] = None) -> bool:
         """运行工作流"""
         print("\n[Run] Starting LLM UT Generation Workflow...")
         print("=" * 60)
@@ -331,6 +333,24 @@ Then verify with:
             cmd.append("--skip-quality-gates")
         if quality_cfg.get("strict") is True:
             cmd.append("--quality-strict")
+
+        compile_fix_cfg = self.config.get("test_generation", {}).get("compile_fix", {})
+        effective_auto_fix = compile_fix_cfg.get("auto_fix_compile_errors", True)
+        if auto_fix_compile_errors is not None:
+            effective_auto_fix = auto_fix_compile_errors
+
+        effective_max_fix_attempts = compile_fix_cfg.get("max_fix_attempts", 2)
+        try:
+            effective_max_fix_attempts = int(effective_max_fix_attempts)
+        except (TypeError, ValueError):
+            effective_max_fix_attempts = 2
+        if max_fix_attempts is not None:
+            effective_max_fix_attempts = max_fix_attempts
+        effective_max_fix_attempts = max(0, effective_max_fix_attempts)
+
+        if not effective_auto_fix:
+            cmd.append("--no-auto-fix-compile")
+        cmd.extend(["--max-fix-attempts", str(effective_max_fix_attempts)])
 
         # 从配置透传LLM后端与Ollama设置到子进程环境
         env = os.environ.copy()
@@ -477,6 +497,19 @@ def main():
         action="store_true",
         help="Interactive mode"
     )
+
+    parser.add_argument(
+        "--max-fix-attempts",
+        type=int,
+        default=None,
+        help="Override compile auto-fix max retry attempts for quickstart"
+    )
+
+    parser.add_argument(
+        "--no-auto-fix-compile",
+        action="store_true",
+        help="Disable compile auto-fix phase in quickstart"
+    )
     
     args = parser.parse_args()
     
@@ -507,7 +540,11 @@ def main():
     elif args.analyze:
         if not quickstart.check_environment():
             sys.exit(1)
-        if quickstart.run_workflow(analyze_only=True):
+        if quickstart.run_workflow(
+            analyze_only=True,
+            max_fix_attempts=args.max_fix_attempts,
+            auto_fix_compile_errors=(False if args.no_auto_fix_compile else None)
+        ):
             sys.exit(0)
         else:
             sys.exit(1)
@@ -516,7 +553,11 @@ def main():
         if not quickstart.check_environment():
             sys.exit(1)
         functions = args.generate if args.generate else None
-        if quickstart.run_workflow(functions=functions):
+        if quickstart.run_workflow(
+            functions=functions,
+            max_fix_attempts=args.max_fix_attempts,
+            auto_fix_compile_errors=(False if args.no_auto_fix_compile else None)
+        ):
             sys.exit(0)
         else:
             sys.exit(1)

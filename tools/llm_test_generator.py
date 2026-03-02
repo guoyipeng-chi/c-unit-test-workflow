@@ -80,7 +80,7 @@ Return ONLY the C++ test code, no explanations."""
         response = self.llm.generate(
             prompt,
             temperature=0.7,
-            max_tokens=8192,
+            max_tokens=64000,
             top_p=0.95
         )
         
@@ -338,7 +338,7 @@ Target Function: {function_name}
         response = self.llm.generate(
             prompt,
             temperature=0.2,
-            max_tokens=8192,
+            max_tokens=64000,
             top_p=0.9
         )
 
