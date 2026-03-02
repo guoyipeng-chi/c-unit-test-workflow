@@ -572,8 +572,22 @@ class LLMUTWorkflow:
                 print(f"  ✗ Failed to save: {e}")
         
         return results
+
+    @staticmethod
+    def _resolve_target_test_files(test_dir: str,
+                                   target_functions: Optional[List[str]] = None) -> List[str]:
+        """根据目标函数解析本轮应处理的测试文件列表。"""
+        all_tests = sorted([f for f in os.listdir(test_dir) if f.endswith('_llm_test.cpp')])
+        if not target_functions:
+            return all_tests
+
+        target_set = {str(name).strip() for name in target_functions if str(name).strip()}
+        expected = {f"{name}_llm_test.cpp" for name in target_set}
+        return [f for f in all_tests if f in expected]
     
-    def verify_tests(self, test_dir: Optional[str] = None) -> bool:
+    def verify_tests(self,
+                     test_dir: Optional[str] = None,
+                     target_functions: Optional[List[str]] = None) -> bool:
         """验证生成的测试（基本的语法检查）"""
         self._print_key_node("[Step 4/4] Verifying generated tests", bg_code="44")
         print("=" * 60)
@@ -581,11 +595,14 @@ class LLMUTWorkflow:
         if test_dir is None:
             test_dir = self.test_dir
         
-        test_files = [f for f in os.listdir(test_dir) if f.endswith('_llm_test.cpp')]
+        test_files = self._resolve_target_test_files(test_dir, target_functions)
         
         if not test_files:
             print("No test files generated!")
             return False
+
+        if target_functions:
+            print(f"Scoped verification for selected functions: {', '.join(target_functions)}")
         
         print(f"Found {len(test_files)} test files")
         
@@ -613,7 +630,10 @@ class LLMUTWorkflow:
         
         return all_valid
 
-    def run_quality_gates(self, test_dir: Optional[str] = None, strict: bool = False) -> bool:
+    def run_quality_gates(self,
+                          test_dir: Optional[str] = None,
+                          strict: bool = False,
+                          target_functions: Optional[List[str]] = None) -> bool:
         """
         运行生成测试代码的质量闸门工具：clang-format / clang-tidy / cppcheck
 
@@ -634,15 +654,15 @@ class LLMUTWorkflow:
         os.makedirs(log_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        test_files = [
-            os.path.join(test_dir, f)
-            for f in os.listdir(test_dir)
-            if f.endswith('_llm_test.cpp')
-        ]
+        scoped_files = self._resolve_target_test_files(test_dir, target_functions)
+        test_files = [os.path.join(test_dir, f) for f in scoped_files]
 
         if not test_files:
             print("⚠ No generated test files for quality gates")
             return False if strict else True
+
+        if target_functions:
+            print(f"[Quality] Scoped to selected functions: {', '.join(target_functions)}")
 
         include_dirs = ["-I" + self.include_dir]
         if hasattr(self.compile_analyzer, 'compile_info'):
@@ -1132,6 +1152,7 @@ class LLMUTWorkflow:
     
     def run_tests(self, test_dir: Optional[str] = None,
                   build_dir: str = "build-test",
+                  target_functions: Optional[List[str]] = None,
                   auto_fix_compile_errors: bool = True,
                   max_fix_attempts: int = 2,
                   auto_fix_test_failures: bool = True,
@@ -1148,6 +1169,7 @@ class LLMUTWorkflow:
         Args:
             test_dir: 测试文件所在目录
             build_dir: 测试编译目录
+            target_functions: 本轮限定处理的函数列表（仅处理对应测试文件）
             auto_fix_compile_errors: 编译失败后是否自动进入LLM修复阶段
             max_fix_attempts: 最大自动修复重试次数
             auto_fix_test_failures: 测试运行失败后是否自动进入LLM修复阶段
@@ -1172,11 +1194,14 @@ class LLMUTWorkflow:
         os.makedirs(log_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        test_files = [f for f in os.listdir(test_dir) if f.endswith('_llm_test.cpp')]
+        test_files = self._resolve_target_test_files(test_dir, target_functions)
         
         if not test_files:
             print("✗ No test files found to run!")
             return False
+
+        if target_functions:
+            print(f"Scoped run for selected functions: {', '.join(target_functions)}")
         
         print(f"Found {len(test_files)} test file(s) to run")
         
@@ -1930,7 +1955,7 @@ Usage:
         self.analyze_codebase()
         self.print_compile_info()
         self.generate_tests(target_functions)
-        verify_ok = self.verify_tests()
+        verify_ok = self.verify_tests(target_functions=target_functions)
 
         if not verify_ok:
             print("\n⚠ Generated tests did not pass verification checks.")
@@ -1941,7 +1966,7 @@ Usage:
             return
 
         if not skip_quality_gates:
-            quality_ok = self.run_quality_gates(strict=quality_strict)
+            quality_ok = self.run_quality_gates(strict=quality_strict, target_functions=target_functions)
             if not quality_ok:
                 print("\n" + "=" * 60)
                 print("✓ Workflow completed (stopped by quality gates).")
@@ -1949,6 +1974,7 @@ Usage:
         
         if not skip_run:
             self.run_tests(
+                target_functions=target_functions,
                 auto_fix_compile_errors=auto_fix_compile_errors,
                 max_fix_attempts=max_fix_attempts,
                 auto_fix_test_failures=auto_fix_test_failures,
