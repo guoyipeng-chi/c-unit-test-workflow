@@ -304,6 +304,94 @@ class LLMUTWorkflow:
                 all_valid = False
         
         return all_valid
+
+    def _resolve_gtest_link_inputs(self, include_dirs: List[str], build_path: str) -> List[str]:
+        """
+        解析gtest链接输入，优先级：
+        1) 本地已构建的静态库（libgtest_main/libgtest）
+        2) gtest源码（gtest-all.cc + gtest_main.cc）
+        3) 系统库回退（-lgtest -lgtest_main）
+        """
+        candidate_roots = [
+            build_path,
+            os.path.join(self.project_dir, "build"),
+            os.path.join(self.project_dir, "build-test"),
+            os.path.join(self.project_dir, "cmake-build-debug"),
+            os.path.join(self.project_dir, "build-ninja-msvc"),
+        ]
+
+        # 1) 查找已构建库
+        gtest_main_lib = None
+        gtest_lib = None
+        lib_main_names = {"libgtest_main.a", "gtest_main.lib", "libgtest_main.so"}
+        lib_names = {"libgtest.a", "gtest.lib", "libgtest.so"}
+
+        for root in candidate_roots:
+            if not os.path.isdir(root):
+                continue
+            for walk_root, _, files in os.walk(root):
+                for file_name in files:
+                    full_path = os.path.join(walk_root, file_name)
+                    if file_name in lib_main_names and gtest_main_lib is None:
+                        gtest_main_lib = full_path
+                    elif file_name in lib_names and gtest_lib is None:
+                        gtest_lib = full_path
+                if gtest_main_lib and gtest_lib:
+                    break
+            if gtest_main_lib and gtest_lib:
+                break
+
+        if gtest_main_lib and gtest_lib:
+            print(f"[Link] Using local gtest libs: {gtest_main_lib}, {gtest_lib}")
+            return [gtest_main_lib, gtest_lib]
+
+        # 2) 查找gtest源码（避免依赖系统安装的 -lgtest）
+        gtest_root = None
+        for inc_flag in include_dirs:
+            if not inc_flag.startswith("-I"):
+                continue
+            inc_path = inc_flag[2:]
+            marker = os.path.join("googletest", "include")
+            if marker in inc_path:
+                gtest_root = inc_path.split(marker)[0] + "googletest"
+                break
+
+        if not gtest_root:
+            for root in candidate_roots:
+                candidate = os.path.join(root, "_deps", "googletest-src", "googletest")
+                if os.path.isdir(candidate):
+                    gtest_root = candidate
+                    break
+
+        if gtest_root:
+            gtest_all = os.path.join(gtest_root, "src", "gtest-all.cc")
+            gtest_main = os.path.join(gtest_root, "src", "gtest_main.cc")
+            if os.path.exists(gtest_all) and os.path.exists(gtest_main):
+                root_inc = f"-I{gtest_root}"
+                include_inc = f"-I{os.path.join(gtest_root, 'include')}"
+                if root_inc not in include_dirs:
+                    include_dirs.append(root_inc)
+                if include_inc not in include_dirs:
+                    include_dirs.append(include_inc)
+                print(f"[Link] Using gtest sources: {gtest_all}, {gtest_main}")
+                return [gtest_all, gtest_main]
+
+        # 3) 回退到系统库
+        print("[Link] Fallback to system gtest libs: -lgtest -lgtest_main")
+        return ["-lgtest", "-lgtest_main"]
+
+    @staticmethod
+    def _is_toolchain_link_error(stderr_text: str) -> bool:
+        """判断是否为工具链/库缺失类错误（不适合LLM改代码修复）"""
+        if not stderr_text:
+            return False
+        lower = stderr_text.lower()
+        return (
+            "cannot find -lgtest" in lower
+            or "cannot find -lgtest_main" in lower
+            or "ld returned 1 exit status" in lower and "cannot find -l" in lower
+            or "library not found for -lgtest" in lower
+        )
     
     def run_tests(self, test_dir: Optional[str] = None,
                   build_dir: str = "build-test",
@@ -410,7 +498,8 @@ class LLMUTWorkflow:
             compile_cmd.append("-I/usr/include/gtest")
             compile_cmd.extend(source_files)
             compile_cmd.append(test_path)
-            compile_cmd.extend(["-lgtest", "-lgtest_main", "-lpthread"])
+            compile_cmd.extend(self._resolve_gtest_link_inputs(include_dirs, build_path))
+            compile_cmd.extend(["-lpthread"])
             
             try:
                 compile_result = None
@@ -453,6 +542,12 @@ class LLMUTWorkflow:
                         log_file.write("\nSTDERR:\n")
                         log_file.write(compile_result.stderr or "")
                     print(f"  ↳ Compile log saved: {compile_log_path}")
+
+                    # 工具链/依赖错误：无需进入LLM修复阶段
+                    if self._is_toolchain_link_error(compile_result.stderr or ""):
+                        print("  ⚠ Linker/toolchain error detected (e.g. missing gtest library).")
+                        print("    Skipping LLM code-fix because this is not a test code issue.")
+                        break
 
                     # 到达重试上限或未启用自动修复
                     if (not auto_fix_compile_errors) or attempt >= max_fix_attempts:
