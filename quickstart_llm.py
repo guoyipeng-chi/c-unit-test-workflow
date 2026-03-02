@@ -408,7 +408,9 @@ Then verify with:
 Enter your choice (1-7):
 """)
     
-    def interactive_mode(self) -> None:
+    def interactive_mode(self,
+                         max_fix_attempts: Optional[int] = None,
+                         auto_fix_compile_errors: Optional[bool] = None) -> None:
         """交互模式"""
         while True:
             self.show_menu()
@@ -425,14 +427,22 @@ Enter your choice (1-7):
                 if not self.check_environment(prompt_install_compiler=True):
                     print("✗ Environment check failed!")
                     continue
-                self.run_workflow(analyze_only=True)
+                self.run_workflow(
+                    analyze_only=True,
+                    max_fix_attempts=max_fix_attempts,
+                    auto_fix_compile_errors=auto_fix_compile_errors
+                )
             elif choice == "5":
                 if not self.check_environment(prompt_install_compiler=True):
                     print("✗ Environment check failed!")
                     continue
                 functions = input("Enter function names (space-separated, or leave blank for all): ")
                 func_list = functions.split() if functions.strip() else None
-                self.run_workflow(functions=func_list)
+                self.run_workflow(
+                    functions=func_list,
+                    max_fix_attempts=max_fix_attempts,
+                    auto_fix_compile_errors=auto_fix_compile_errors
+                )
             elif choice == "6":
                 if not self.check_environment(prompt_install_compiler=True):
                     print("✗ Environment check failed!")
@@ -441,7 +451,10 @@ Enter your choice (1-7):
                     print("No compile_commands.json found. Generating...")
                     if not self.generate_compile_commands():
                         continue
-                self.run_workflow()
+                self.run_workflow(
+                    max_fix_attempts=max_fix_attempts,
+                    auto_fix_compile_errors=auto_fix_compile_errors
+                )
             elif choice == "7":
                 print("Goodbye!")
                 break
@@ -514,10 +527,21 @@ def main():
     args = parser.parse_args()
     
     quickstart = QuickStart(project_root=args.project_dir)
+
+    action_requested = any([
+        args.check,
+        args.setup_vllm,
+        args.generate_compile_commands,
+        args.analyze,
+        args.generate is not None,
+    ])
     
     # 交互模式（默认）
-    if args.interactive or len(sys.argv) == 1:
-        quickstart.interactive_mode()
+    if args.interactive or not action_requested:
+        quickstart.interactive_mode(
+            max_fix_attempts=args.max_fix_attempts,
+            auto_fix_compile_errors=(False if args.no_auto_fix_compile else None)
+        )
     
     # 命令行模式
     elif args.check:
