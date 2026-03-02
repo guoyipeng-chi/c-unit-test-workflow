@@ -76,6 +76,14 @@ class QuickStart:
 
         return None, None
 
+    @staticmethod
+    def _default_external_experience_path() -> str:
+        """返回仓库外的经验库默认路径（用于不跟Git场景）。"""
+        if os.name == 'nt':
+            base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+            return str(Path(base) / "c-unit-test-workflow" / "experience_store.jsonl")
+        return str(Path.home() / ".local" / "share" / "c-unit-test-workflow" / "experience_store.jsonl")
+
     def _auto_install_compiler(self) -> bool:
         """自动安装编译器（当前仅Windows支持winget安装LLVM）。"""
         if os.name != 'nt':
@@ -308,7 +316,10 @@ Then verify with:
                      llm_triage_enabled: Optional[bool] = None,
                      triage_min_confidence: Optional[float] = None,
                      web_research_enabled: Optional[bool] = None,
-                     web_research_max_results: Optional[int] = None) -> bool:
+                     web_research_max_results: Optional[int] = None,
+                     experience_learning_enabled: Optional[bool] = None,
+                     experience_top_k: Optional[int] = None,
+                     experience_store_path: Optional[str] = None) -> bool:
         """运行工作流"""
         print("\n[Run] Starting LLM UT Generation Workflow...")
         print("=" * 60)
@@ -409,6 +420,33 @@ Then verify with:
             cmd.append("--disable-web-research")
         cmd.extend(["--web-research-max-results", str(effective_web_research_max_results)])
 
+        effective_experience_learning_enabled = compile_fix_cfg.get("experience_learning_enabled", True)
+        if experience_learning_enabled is not None:
+            effective_experience_learning_enabled = experience_learning_enabled
+
+        effective_experience_top_k = compile_fix_cfg.get("experience_top_k", 3)
+        try:
+            effective_experience_top_k = int(effective_experience_top_k)
+        except (TypeError, ValueError):
+            effective_experience_top_k = 3
+        if experience_top_k is not None:
+            effective_experience_top_k = experience_top_k
+        effective_experience_top_k = max(1, effective_experience_top_k)
+
+        effective_experience_store_path = compile_fix_cfg.get("experience_store_path", "./log/experience_store.jsonl")
+        if experience_store_path is not None:
+            effective_experience_store_path = experience_store_path
+
+        effective_experience_track_in_git = compile_fix_cfg.get("experience_track_in_git", True)
+        if experience_store_path is None and not bool(effective_experience_track_in_git):
+            effective_experience_store_path = self._default_external_experience_path()
+
+        if not effective_experience_learning_enabled:
+            cmd.append("--disable-experience-learning")
+        cmd.extend(["--experience-top-k", str(effective_experience_top_k)])
+        if effective_experience_store_path:
+            cmd.extend(["--experience-store-path", str(effective_experience_store_path)])
+
         # 从配置透传LLM后端与Ollama设置到子进程环境
         env = os.environ.copy()
         llm_cfg = self.config.get("llm", {})
@@ -473,7 +511,10 @@ Enter your choice (1-7):
                          llm_triage_enabled: Optional[bool] = None,
                          triage_min_confidence: Optional[float] = None,
                          web_research_enabled: Optional[bool] = None,
-                         web_research_max_results: Optional[int] = None) -> None:
+                         web_research_max_results: Optional[int] = None,
+                         experience_learning_enabled: Optional[bool] = None,
+                         experience_top_k: Optional[int] = None,
+                         experience_store_path: Optional[str] = None) -> None:
         """交互模式"""
         while True:
             self.show_menu()
@@ -499,7 +540,10 @@ Enter your choice (1-7):
                     llm_triage_enabled=llm_triage_enabled,
                     triage_min_confidence=triage_min_confidence,
                     web_research_enabled=web_research_enabled,
-                    web_research_max_results=web_research_max_results
+                    web_research_max_results=web_research_max_results,
+                    experience_learning_enabled=experience_learning_enabled,
+                    experience_top_k=experience_top_k,
+                    experience_store_path=experience_store_path
                 )
             elif choice == "5":
                 if not self.check_environment(prompt_install_compiler=True):
@@ -516,7 +560,10 @@ Enter your choice (1-7):
                     llm_triage_enabled=llm_triage_enabled,
                     triage_min_confidence=triage_min_confidence,
                     web_research_enabled=web_research_enabled,
-                    web_research_max_results=web_research_max_results
+                    web_research_max_results=web_research_max_results,
+                    experience_learning_enabled=experience_learning_enabled,
+                    experience_top_k=experience_top_k,
+                    experience_store_path=experience_store_path
                 )
             elif choice == "6":
                 if not self.check_environment(prompt_install_compiler=True):
@@ -534,7 +581,10 @@ Enter your choice (1-7):
                     llm_triage_enabled=llm_triage_enabled,
                     triage_min_confidence=triage_min_confidence,
                     web_research_enabled=web_research_enabled,
-                    web_research_max_results=web_research_max_results
+                    web_research_max_results=web_research_max_results,
+                    experience_learning_enabled=experience_learning_enabled,
+                    experience_top_k=experience_top_k,
+                    experience_store_path=experience_store_path
                 )
             elif choice == "7":
                 print("Goodbye!")
@@ -643,6 +693,25 @@ def main():
         default=None,
         help="Maximum number of web references used as fix context"
     )
+
+    parser.add_argument(
+        "--disable-experience-learning",
+        action="store_true",
+        help="Disable experience accumulation and historical experience retrieval"
+    )
+
+    parser.add_argument(
+        "--experience-top-k",
+        type=int,
+        default=None,
+        help="Top-K historical experiences used as fix context"
+    )
+
+    parser.add_argument(
+        "--experience-store-path",
+        default=None,
+        help="Path to experience store jsonl file"
+    )
     
     args = parser.parse_args()
     
@@ -666,7 +735,10 @@ def main():
             llm_triage_enabled=(False if args.disable_llm_triage else None),
             triage_min_confidence=args.triage_min_confidence,
             web_research_enabled=(False if args.disable_web_research else None),
-            web_research_max_results=args.web_research_max_results
+            web_research_max_results=args.web_research_max_results,
+            experience_learning_enabled=(False if args.disable_experience_learning else None),
+            experience_top_k=args.experience_top_k,
+            experience_store_path=args.experience_store_path
         )
     
     # 命令行模式
@@ -699,7 +771,10 @@ def main():
             llm_triage_enabled=(False if args.disable_llm_triage else None),
             triage_min_confidence=args.triage_min_confidence,
             web_research_enabled=(False if args.disable_web_research else None),
-            web_research_max_results=args.web_research_max_results
+            web_research_max_results=args.web_research_max_results,
+            experience_learning_enabled=(False if args.disable_experience_learning else None),
+            experience_top_k=args.experience_top_k,
+            experience_store_path=args.experience_store_path
         ):
             sys.exit(0)
         else:
@@ -718,7 +793,10 @@ def main():
             llm_triage_enabled=(False if args.disable_llm_triage else None),
             triage_min_confidence=args.triage_min_confidence,
             web_research_enabled=(False if args.disable_web_research else None),
-            web_research_max_results=args.web_research_max_results
+            web_research_max_results=args.web_research_max_results,
+            experience_learning_enabled=(False if args.disable_experience_learning else None),
+            experience_top_k=args.experience_top_k,
+            experience_store_path=args.experience_store_path
         ):
             sys.exit(0)
         else:

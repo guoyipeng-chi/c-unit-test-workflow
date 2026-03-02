@@ -11,6 +11,7 @@ import json
 import subprocess
 import shutil
 import re
+import difflib
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -22,6 +23,7 @@ from c_code_analyzer import CCodeAnalyzer
 from compile_commands_analyzer import CompileCommandsAnalyzer
 from llm_client import VLLMClient, create_client
 from llm_test_generator import LLMTestGenerator
+from experience_store import ExperienceStore
 
 
 class LLMUTWorkflow:
@@ -32,7 +34,10 @@ class LLMUTWorkflow:
                  include_dir: Optional[str] = None,
                  src_dir: Optional[str] = None,
                  llm_api_base: Optional[str] = None,
-                 llm_model: Optional[str] = None):
+                 llm_model: Optional[str] = None,
+                 experience_store_path: Optional[str] = None,
+                 experience_learning_enabled: bool = True,
+                 experience_top_k: int = 3):
         """
         初始化工作流
         
@@ -74,6 +79,22 @@ class LLMUTWorkflow:
         
         # 初始化LLM测试生成器（传入compile_analyzer用于提取完整的include）
         self.test_generator = LLMTestGenerator(self.llm_client, compile_analyzer=self.compile_analyzer)
+
+        self.experience_learning_enabled = bool(experience_learning_enabled)
+        self.experience_top_k = max(1, int(experience_top_k or 3))
+        self.experience_store = None
+        if self.experience_learning_enabled:
+            exp_path = experience_store_path or os.path.join(self.project_dir, "log", "experience_store.jsonl")
+            self.experience_store = ExperienceStore(exp_path)
+            print(f"[Memory] Experience store: {exp_path}")
+
+    @staticmethod
+    def _default_external_experience_path() -> str:
+        """返回仓库外的经验库默认路径（用于不跟Git场景）。"""
+        if os.name == 'nt':
+            base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+            return os.path.join(base, "c-unit-test-workflow", "experience_store.jsonl")
+        return os.path.join(os.path.expanduser("~"), ".local", "share", "c-unit-test-workflow", "experience_store.jsonl")
     
     @classmethod
     def from_config(cls, config_file: str, 
@@ -153,6 +174,18 @@ class LLMUTWorkflow:
         llm_config = config.get('llm', {})
         llm_api_base = llm_config.get('api_base', 'http://localhost:8000')
         llm_model = llm_config.get('model', 'qwen-coder')
+        compile_fix_cfg = config.get('test_generation', {}).get('compile_fix', {})
+        experience_learning_enabled = bool(compile_fix_cfg.get('experience_learning_enabled', True))
+        experience_top_k = int(compile_fix_cfg.get('experience_top_k', 3) or 3)
+        experience_track_in_git = bool(compile_fix_cfg.get('experience_track_in_git', True))
+        configured_exp_path = compile_fix_cfg.get('experience_store_path')
+
+        if experience_track_in_git:
+            experience_store_path = configured_exp_path or './log/experience_store.jsonl'
+            if not os.path.isabs(str(experience_store_path)):
+                experience_store_path = os.path.join(project_root, str(experience_store_path))
+        else:
+            experience_store_path = LLMUTWorkflow._default_external_experience_path()
 
         # 透传后端/Ollama配置到环境变量（仅在未显式设置环境变量时）
         backend = llm_config.get('backend')
@@ -186,8 +219,31 @@ class LLMUTWorkflow:
             include_dir=include_dir,
             src_dir=src_dir,
             llm_api_base=llm_api_base,
-            llm_model=llm_model
+            llm_model=llm_model,
+            experience_store_path=str(experience_store_path),
+            experience_learning_enabled=experience_learning_enabled,
+            experience_top_k=experience_top_k
         )
+
+    @staticmethod
+    def _summarize_code_change(before_code: str, after_code: str, max_lines: int = 24) -> str:
+        if before_code == after_code:
+            return "no_text_change"
+        diff_lines = list(
+            difflib.unified_diff(
+                before_code.splitlines(),
+                after_code.splitlines(),
+                fromfile="before",
+                tofile="after",
+                lineterm=""
+            )
+        )
+        if not diff_lines:
+            return "text_changed"
+        preview = "\n".join(diff_lines[:max_lines])
+        if len(diff_lines) > max_lines:
+            preview += "\n..."
+        return preview
     
     def analyze_codebase(self) -> None:
         """分析代码库"""
@@ -856,7 +912,9 @@ class LLMUTWorkflow:
                   llm_triage_enabled: bool = True,
                   triage_min_confidence: float = 0.55,
                   web_research_enabled: bool = True,
-                  web_research_max_results: int = 4) -> bool:
+                  web_research_max_results: int = 4,
+                  experience_learning_enabled: bool = True,
+                  experience_top_k: int = 3) -> bool:
         """
         编译并执行生成的测试用例
         
@@ -871,6 +929,8 @@ class LLMUTWorkflow:
             triage_min_confidence: 触发修复的最低诊断置信度
             web_research_enabled: triage后是否进行在线检索增强
             web_research_max_results: 在线检索最多返回条数
+            experience_learning_enabled: 是否启用经验积累与检索
+            experience_top_k: 经验检索返回条数
             
         Returns:
             是否执行成功
@@ -1095,6 +1155,21 @@ class LLMUTWorkflow:
                                     except Exception as research_error:
                                         print(f"  ⚠ Web research failed (compile triage): {research_error}")
 
+                                if experience_learning_enabled and self.experience_store:
+                                    try:
+                                        memory_refs = self.experience_store.query_experiences(
+                                            root_cause=str(triage_result.get("root_cause", "")),
+                                            error_type=str(triage_result.get("error_type", "unknown")),
+                                            phase="compile",
+                                            key_symbols=triage_result.get("key_symbols", []),
+                                            top_k=experience_top_k
+                                        )
+                                        if memory_refs:
+                                            triage_result["experience_hints"] = memory_refs
+                                            print(f"  [Memory] Retrieved {len(memory_refs)} compile experience(s)")
+                                    except Exception as memory_error:
+                                        print(f"  ⚠ Experience query failed (compile): {memory_error}")
+
                                 triage_conf = float(triage_result.get("confidence", 0.0) or 0.0)
                                 triage_type = str(triage_result.get("error_type", "unknown"))
                                 triage_cause = str(triage_result.get("root_cause", ""))
@@ -1125,6 +1200,7 @@ class LLMUTWorkflow:
                         try:
                             with open(test_path, 'r', encoding='utf-8') as f:
                                 current_test_code = f.read()
+                            before_fix_code = current_test_code
 
                             fixed_test_code = self.test_generator.fix_test_from_compile_error(
                                 current_test_code=current_test_code,
@@ -1146,6 +1222,25 @@ class LLMUTWorkflow:
 
                             print(f"  ↳ Auto-fix applied and saved: {test_path}")
                             print(f"  ↳ Auto-fix log saved: {fix_log_path}")
+
+                            if experience_learning_enabled and self.experience_store:
+                                try:
+                                    self.experience_store.add_experience({
+                                        "phase": "compile",
+                                        "function_name": test_name.replace("_llm_test", ""),
+                                        "test_file": test_file,
+                                        "error_type": str(triage_result.get("error_type", "unknown")),
+                                        "root_cause": str(triage_result.get("root_cause", "")),
+                                        "key_symbols": triage_result.get("key_symbols", []),
+                                        "fix_strategy": triage_result.get("fix_strategy", []),
+                                        "summary": str(triage_result.get("minimal_change", "compile fix applied")),
+                                        "change_preview": self._summarize_code_change(before_fix_code, fixed_test_code),
+                                        "outcome": "fix_applied_pending_recompile",
+                                        "attempt": llm_fix_count + 1
+                                    })
+                                except Exception as memory_write_error:
+                                    print(f"  ⚠ Experience write failed (compile): {memory_write_error}")
+
                             llm_fix_count += 1
                             compile_round += 1
                         except Exception as fix_error:
@@ -1243,6 +1338,21 @@ class LLMUTWorkflow:
                                 except Exception as research_error:
                                     print(f"  ⚠ Web research failed (runtime triage): {research_error}")
 
+                            if experience_learning_enabled and self.experience_store:
+                                try:
+                                    memory_refs = self.experience_store.query_experiences(
+                                        root_cause=str(runtime_triage_result.get("root_cause", "")),
+                                        error_type=str(runtime_triage_result.get("error_type", "unknown")),
+                                        phase="runtime",
+                                        key_symbols=runtime_triage_result.get("key_symbols", []),
+                                        top_k=experience_top_k
+                                    )
+                                    if memory_refs:
+                                        runtime_triage_result["experience_hints"] = memory_refs
+                                        print(f"  [Memory] Retrieved {len(memory_refs)} runtime experience(s)")
+                                except Exception as memory_error:
+                                    print(f"  ⚠ Experience query failed (runtime): {memory_error}")
+
                             triage_conf = float(runtime_triage_result.get("confidence", 0.0) or 0.0)
                             triage_type = str(runtime_triage_result.get("error_type", "unknown"))
                             triage_cause = str(runtime_triage_result.get("root_cause", ""))
@@ -1278,6 +1388,7 @@ class LLMUTWorkflow:
                     try:
                         with open(test_path, 'r', encoding='utf-8') as f:
                             current_test_code = f.read()
+                        before_fix_code = current_test_code
 
                         fixed_test_code = self.test_generator.fix_test_from_test_failure(
                             current_test_code=current_test_code,
@@ -1302,6 +1413,25 @@ class LLMUTWorkflow:
 
                         print(f"  ↳ Runtime auto-fix applied and saved: {test_path}")
                         print(f"  ↳ Runtime auto-fix log saved: {fix_log_path}")
+
+                        if experience_learning_enabled and self.experience_store:
+                            try:
+                                self.experience_store.add_experience({
+                                    "phase": "runtime",
+                                    "function_name": test_name.replace("_llm_test", ""),
+                                    "test_file": test_file,
+                                    "error_type": str(runtime_triage_result.get("error_type", "unknown")),
+                                    "root_cause": str(runtime_triage_result.get("root_cause", "")),
+                                    "key_symbols": runtime_triage_result.get("key_symbols", []),
+                                    "fix_strategy": runtime_triage_result.get("fix_strategy", []),
+                                    "summary": str(runtime_triage_result.get("minimal_change", "runtime fix applied")),
+                                    "change_preview": self._summarize_code_change(before_fix_code, fixed_test_code),
+                                    "outcome": "fix_applied_pending_rerun",
+                                    "attempt": runtime_fix_count + 1
+                                })
+                            except Exception as memory_write_error:
+                                print(f"  ⚠ Experience write failed (runtime): {memory_write_error}")
+
                         runtime_fix_count += 1
                         if compile_round >= max_compile_rounds - 1:
                             max_compile_rounds += 1
@@ -1381,6 +1511,8 @@ Usage:
                           triage_min_confidence: float = 0.55,
                           web_research_enabled: bool = True,
                           web_research_max_results: int = 4,
+                          experience_learning_enabled: bool = True,
+                          experience_top_k: int = 3,
                           skip_quality_gates: bool = False,
                           quality_strict: bool = False) -> None:
         """
@@ -1397,6 +1529,8 @@ Usage:
             triage_min_confidence: 诊断最低置信度阈值
             web_research_enabled: triage后是否进行在线检索增强
             web_research_max_results: 在线检索最大返回条数
+            experience_learning_enabled: 是否启用经验积累与检索
+            experience_top_k: 经验检索返回条数
             skip_quality_gates: 是否跳过clang-format/clang-tidy/cppcheck质量闸门
             quality_strict: 质量闸门严格模式（有问题即停止）
         """
@@ -1430,7 +1564,9 @@ Usage:
                 llm_triage_enabled=llm_triage_enabled,
                 triage_min_confidence=triage_min_confidence
                 ,web_research_enabled=web_research_enabled,
-                web_research_max_results=web_research_max_results
+                web_research_max_results=web_research_max_results,
+                experience_learning_enabled=experience_learning_enabled,
+                experience_top_k=experience_top_k
             )
         
         print("\n" + "=" * 60)
@@ -1582,6 +1718,25 @@ def main():
     )
 
     parser.add_argument(
+        "--disable-experience-learning",
+        action="store_true",
+        help="Disable experience accumulation and historical experience retrieval"
+    )
+
+    parser.add_argument(
+        "--experience-top-k",
+        type=int,
+        default=None,
+        help="Top-K historical experiences to retrieve for each triage"
+    )
+
+    parser.add_argument(
+        "--experience-store-path",
+        default=None,
+        help="Path to experience store jsonl file"
+    )
+
+    parser.add_argument(
         "--skip-quality-gates",
         action="store_true",
         help="Skip quality gates (clang-format / clang-tidy / cppcheck)"
@@ -1605,6 +1760,10 @@ def main():
     effective_triage_min_conf = args.triage_min_confidence if args.triage_min_confidence is not None else 0.55
     effective_web_research_enabled = not args.disable_web_research
     effective_web_research_max_results = args.web_research_max_results if args.web_research_max_results is not None else 4
+    effective_experience_learning_enabled = not args.disable_experience_learning
+    effective_experience_top_k = args.experience_top_k if args.experience_top_k is not None else 3
+    effective_experience_store_path = args.experience_store_path
+    effective_experience_track_in_git = True
     
     # 优先从配置文件加载
     if args.config:
@@ -1644,6 +1803,9 @@ def main():
                 effective_llm_triage_enabled = False
             if not args.disable_web_research and compile_fix_cfg.get('web_research_enabled') is False:
                 effective_web_research_enabled = False
+            if not args.disable_experience_learning and compile_fix_cfg.get('experience_learning_enabled') is False:
+                effective_experience_learning_enabled = False
+            effective_experience_track_in_git = bool(compile_fix_cfg.get('experience_track_in_git', True))
             if args.triage_min_confidence is None:
                 try:
                     effective_triage_min_conf = float(compile_fix_cfg.get('triage_min_confidence', 0.55))
@@ -1654,6 +1816,22 @@ def main():
                     effective_web_research_max_results = int(compile_fix_cfg.get('web_research_max_results', 4))
                 except (TypeError, ValueError):
                     effective_web_research_max_results = 4
+            if args.experience_top_k is None:
+                try:
+                    effective_experience_top_k = int(compile_fix_cfg.get('experience_top_k', 3))
+                except (TypeError, ValueError):
+                    effective_experience_top_k = 3
+            if args.experience_store_path is None:
+                cfg_exp_path = compile_fix_cfg.get('experience_store_path')
+                if not effective_experience_track_in_git:
+                    effective_experience_store_path = LLMUTWorkflow._default_external_experience_path()
+                elif cfg_exp_path:
+                    if os.path.isabs(str(cfg_exp_path)):
+                        effective_experience_store_path = str(cfg_exp_path)
+                    else:
+                        effective_experience_store_path = os.path.abspath(
+                            os.path.join(workflow.project_dir, str(cfg_exp_path))
+                        )
         except Exception as e:
             print(f"✗ Failed to load config: {e}")
             sys.exit(1)
@@ -1682,6 +1860,11 @@ def main():
         workflow.analyze_codebase()
         workflow.print_compile_info()
     else:
+        workflow.experience_learning_enabled = bool(effective_experience_learning_enabled)
+        workflow.experience_top_k = max(1, effective_experience_top_k)
+        if effective_experience_store_path and effective_experience_learning_enabled:
+            workflow.experience_store = ExperienceStore(effective_experience_store_path)
+
         workflow.run_full_workflow(
             target_functions=args.functions,
             skip_run=args.skip_run,
@@ -1693,6 +1876,8 @@ def main():
             triage_min_confidence=max(0.0, min(1.0, effective_triage_min_conf)),
             web_research_enabled=effective_web_research_enabled,
             web_research_max_results=max(1, effective_web_research_max_results),
+            experience_learning_enabled=effective_experience_learning_enabled,
+            experience_top_k=max(1, effective_experience_top_k),
             skip_quality_gates=effective_skip_quality_gates,
             quality_strict=effective_quality_strict
         )

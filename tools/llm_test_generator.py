@@ -443,6 +443,13 @@ Target Function: {function_name}
 Use this analysis as primary guidance and perform minimal, targeted changes.
 """
 
+            if compile_analysis.get("experience_hints"):
+                prompt += """
+
+Apply relevant historical experience hints when they match the current failure pattern.
+Prefer proven fixes from similar past cases before trying novel changes.
+"""
+
         logger.info(f"Fixing test code from compile error for {function_name}...")
         response = self.llm.generate(
             prompt,
@@ -700,6 +707,13 @@ Target Function: {function_name}
 ```
 
 Use this analysis as primary guidance and perform minimal, targeted changes.
+"""
+
+            if failure_analysis.get("experience_hints"):
+                prompt += """
+
+Apply relevant historical experience hints when they match the current failure pattern.
+Prefer proven fixes from similar past cases before trying novel changes.
 """
 
         logger.info(f"Fixing runtime test failure for {function_name}...")
