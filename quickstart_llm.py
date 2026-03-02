@@ -9,6 +9,7 @@ import os
 import json
 import argparse
 import subprocess
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -74,7 +75,12 @@ class QuickStart:
         # 检查vLLM连接
         api_base = self.config.get("llm", {}).get("api_base", "http://localhost:8000")
         has_vllm = self._check_vllm_connection(api_base)
-        checks.append(("vLLM service", has_vllm, api_base))
+        checks.append(("LLM service", has_vllm, api_base))
+
+        # 检查C++编译器
+        compiler = shutil.which("g++") or shutil.which("clang++") or shutil.which("cl")
+        has_compiler = compiler is not None
+        checks.append(("C++ compiler", has_compiler, compiler or "Not found"))
         
         # 打印检查结果
         all_passed = True
@@ -99,16 +105,51 @@ class QuickStart:
         return None
     
     def _check_vllm_connection(self, api_base: str) -> bool:
-        """检查vLLM连接"""
+        """检查LLM连接（vLLM或Ollama）"""
+        backup_keys = [
+            "LLM_BACKEND", "VLLM_API_BASE", "VLLM_MODEL", "VLLM_TIMEOUT",
+            "OLLAMA_API_BASE", "OLLAMA_MODEL", "OLLAMA_TIMEOUT", "OLLAMA_MAX_TOKENS",
+            "VLLM_FALLBACK_TO_OLLAMA"
+        ]
+        backup = {k: os.environ.get(k) for k in backup_keys}
+
         try:
-            import requests
-            response = requests.get(
-                f"{api_base}/v1/models",
-                timeout=5
-            )
-            return response.status_code == 200
-        except:
+            llm_cfg = self.config.get("llm", {})
+            ollama_cfg = llm_cfg.get("ollama", {})
+
+            if llm_cfg.get("backend"):
+                os.environ["LLM_BACKEND"] = str(llm_cfg.get("backend"))
+            if llm_cfg.get("api_base"):
+                os.environ["VLLM_API_BASE"] = str(llm_cfg.get("api_base"))
+            if llm_cfg.get("model"):
+                os.environ["VLLM_MODEL"] = str(llm_cfg.get("model"))
+            if llm_cfg.get("timeout") is not None:
+                os.environ["VLLM_TIMEOUT"] = str(llm_cfg.get("timeout"))
+
+            if ollama_cfg.get("api_base"):
+                os.environ["OLLAMA_API_BASE"] = str(ollama_cfg.get("api_base"))
+            if ollama_cfg.get("model"):
+                os.environ["OLLAMA_MODEL"] = str(ollama_cfg.get("model"))
+            if ollama_cfg.get("timeout") is not None:
+                os.environ["OLLAMA_TIMEOUT"] = str(ollama_cfg.get("timeout"))
+            if ollama_cfg.get("max_tokens") is not None:
+                os.environ["OLLAMA_MAX_TOKENS"] = str(ollama_cfg.get("max_tokens"))
+            if ollama_cfg.get("fallback_from_vllm") is not None:
+                os.environ["VLLM_FALLBACK_TO_OLLAMA"] = str(ollama_cfg.get("fallback_from_vllm"))
+
+            sys.path.insert(0, str(self.tools_dir))
+            from llm_client import VLLMClient
+
+            client = VLLMClient(api_base=api_base)
+            return client.active_backend is not None
+        except Exception:
             return False
+        finally:
+            for key, value in backup.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
     
     def setup_vllm(self) -> None:
         """帮助设置vLLM"""
@@ -202,9 +243,34 @@ Then verify with:
         
         if functions:
             cmd.extend(["--functions"] + functions)
+
+        # 从配置透传LLM后端与Ollama设置到子进程环境
+        env = os.environ.copy()
+        llm_cfg = self.config.get("llm", {})
+        ollama_cfg = llm_cfg.get("ollama", {})
+
+        if llm_cfg.get("backend"):
+            env["LLM_BACKEND"] = str(llm_cfg.get("backend"))
+        if llm_cfg.get("api_base"):
+            env["VLLM_API_BASE"] = str(llm_cfg.get("api_base"))
+        if llm_cfg.get("model"):
+            env["VLLM_MODEL"] = str(llm_cfg.get("model"))
+        if llm_cfg.get("timeout") is not None:
+            env["VLLM_TIMEOUT"] = str(llm_cfg.get("timeout"))
+
+        if ollama_cfg.get("api_base"):
+            env["OLLAMA_API_BASE"] = str(ollama_cfg.get("api_base"))
+        if ollama_cfg.get("model"):
+            env["OLLAMA_MODEL"] = str(ollama_cfg.get("model"))
+        if ollama_cfg.get("timeout") is not None:
+            env["OLLAMA_TIMEOUT"] = str(ollama_cfg.get("timeout"))
+        if ollama_cfg.get("max_tokens") is not None:
+            env["OLLAMA_MAX_TOKENS"] = str(ollama_cfg.get("max_tokens"))
+        if ollama_cfg.get("fallback_from_vllm") is not None:
+            env["VLLM_FALLBACK_TO_OLLAMA"] = str(ollama_cfg.get("fallback_from_vllm"))
         
         # 运行工作流
-        result = subprocess.run(cmd, cwd=str(self.tools_dir))
+        result = subprocess.run(cmd, cwd=str(self.tools_dir), env=env)
         
         return result.returncode == 0
     

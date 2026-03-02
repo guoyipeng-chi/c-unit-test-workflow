@@ -6,6 +6,8 @@
   },
   
   "llm": {
+    "backend": "auto",
+    "backend_comment": "可选: auto / vllm / ollama。auto=优先vLLM，失败回退Ollama",
     "api_base": "http://localhost:8000",
     "api_base_comment": "可通过环境变量 VLLM_API_BASE 覆盖",
     "remote_examples": {
@@ -14,10 +16,20 @@
       "cloud_server": "http://your-server.com:8000"
     },
     "model": "qwen-coder",
+    "model_comment": "vLLM模型名（仅backend=vllm或auto命中vllm时使用）",
     "temperature": 0.7,
     "max_tokens": 4096,
     "top_p": 0.95,
-    "timeout": 120
+    "timeout": 120,
+
+    "ollama": {
+      "api_base": "http://localhost:11434",
+      "model": "gpt-oss:120b-cloud",
+      "timeout": 900,
+      "max_tokens": 64000,
+      "fallback_from_vllm": true,
+      "comment": "可改为gpt-oss:120b-cloud等Ollama可用模型"
+    }
   },
   
   "code_analysis": {

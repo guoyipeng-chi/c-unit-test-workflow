@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-LLM Client for vLLM Qwen3 Coder
-使用OpenAI兼容的API调用远程vLLM服务的Qwen3 Coder
+LLM Client (vLLM + Ollama fallback)
+优先使用vLLM；当vLLM不可用时可自动回退到Ollama
 """
 
 import requests
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class VLLMClient:
-    """vLLM客户端，通过OpenAI API兼容接口调用Qwen3 Coder"""
+    """统一LLM客户端：vLLM优先，支持自动回退Ollama"""
     
     def __init__(self, api_base: Optional[str] = None, 
                  model: str = "qwen-coder", 
@@ -51,24 +51,150 @@ class VLLMClient:
         self.model = os.getenv('VLLM_MODEL') or model
         self.api_key = os.getenv('VLLM_API_KEY') or api_key
         self.timeout = int(os.getenv('VLLM_TIMEOUT', '120'))
+
+        # Ollama配置
+        self.ollama_api_base = (os.getenv('OLLAMA_API_BASE') or "http://localhost:11434").rstrip('/')
+        self.ollama_model = os.getenv('OLLAMA_MODEL') or "deepseek-r1:7b"
+        self.ollama_timeout = int(os.getenv('OLLAMA_TIMEOUT', '900'))
+        self.ollama_max_tokens = int(os.getenv('OLLAMA_MAX_TOKENS', '2048'))
+
+        # 后端策略: auto / vllm / ollama
+        self.backend_preference = (os.getenv('LLM_BACKEND') or "auto").strip().lower()
+        self.allow_ollama_fallback = (os.getenv('VLLM_FALLBACK_TO_OLLAMA', 'true').strip().lower()
+                          in ('1', 'true', 'yes', 'on'))
+
+        self.active_backend = None
+        self.active_api_base = None
+        self.active_model = None
         
         # 检查连接
         self._check_connection()
     
     def _check_connection(self) -> bool:
-        """检查与vLLM服务的连接"""
+        """检查连接并选择可用后端"""
+        # 强制使用Ollama
+        if self.backend_preference == 'ollama':
+            if self._check_ollama_connection():
+                self.active_backend = 'ollama'
+                self.active_api_base = self.ollama_api_base
+                self.active_model = self.ollama_model
+                logger.info(f"✓ Connected to Ollama at {self.active_api_base} (model={self.active_model})")
+                return True
+            logger.warning(f"✗ Cannot connect to Ollama: {self.ollama_api_base}")
+            return False
+
+        # 强制使用vLLM
+        if self.backend_preference == 'vllm':
+            if self._check_vllm_connection():
+                self.active_backend = 'vllm'
+                self.active_api_base = self.api_base
+                self.active_model = self.model
+                logger.info(f"✓ Connected to vLLM service at {self.active_api_base} (model={self.active_model})")
+                return True
+            logger.warning(f"✗ Cannot connect to vLLM: {self.api_base}")
+            return False
+
+        # auto: 优先vLLM，再回退Ollama
+        if self._check_vllm_connection():
+            self.active_backend = 'vllm'
+            self.active_api_base = self.api_base
+            self.active_model = self.model
+            logger.info(f"✓ Connected to vLLM service at {self.active_api_base} (model={self.active_model})")
+            return True
+
+        if self.allow_ollama_fallback and self._check_ollama_connection():
+            self.active_backend = 'ollama'
+            self.active_api_base = self.ollama_api_base
+            self.active_model = self.ollama_model
+            logger.info(f"✓ vLLM unavailable, fallback to Ollama at {self.active_api_base} (model={self.active_model})")
+            return True
+
+        logger.warning("✗ No available LLM backend (vLLM/Ollama)")
+        return False
+
+    def _check_vllm_connection(self) -> bool:
+        """检查vLLM连接"""
         try:
             response = requests.get(
                 f"{self.api_base}/v1/models",
                 timeout=5,
                 headers={"Authorization": f"Bearer {self.api_key}"}
             )
-            if response.status_code == 200:
-                logger.info(f"✓ Connected to vLLM service at {self.api_base}")
-                return True
+            return response.status_code == 200
         except requests.exceptions.RequestException as e:
-            logger.warning(f"✗ Cannot connect to vLLM: {e}")
+            logger.warning(f"vLLM connection check failed: {e}")
             return False
+
+    def _check_ollama_connection(self) -> bool:
+        """检查Ollama连接"""
+        try:
+            response = requests.get(
+                f"{self.ollama_api_base}/api/tags",
+                timeout=5
+            )
+            return response.status_code == 200
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Ollama connection check failed: {e}")
+            return False
+
+    def _generate_vllm(self, prompt: str, temperature: float, max_tokens: int, top_p: float) -> str:
+        """调用vLLM chat/completions"""
+        url = f"{self.api_base}/v1/chat/completions"
+
+        messages = [{"role": "user", "content": prompt}]
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "top_p": top_p,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
+
+        response = requests.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=self.timeout
+        )
+
+        if response.status_code != 200:
+            raise RuntimeError(f"vLLM API error: {response.status_code} - {response.text}")
+
+        result = response.json()
+        if result.get("choices") and len(result["choices"]) > 0:
+            return result["choices"][0]["message"].get("content", "")
+        return ""
+
+    def _generate_ollama(self, prompt: str, temperature: float, max_tokens: int, top_p: float) -> str:
+        """调用Ollama generate接口"""
+        effective_max_tokens = min(max_tokens, self.ollama_max_tokens)
+        url = f"{self.ollama_api_base}/api/generate"
+        payload = {
+            "model": self.ollama_model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": temperature,
+                "top_p": top_p,
+                "num_predict": effective_max_tokens,
+            }
+        }
+
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=self.ollama_timeout
+        )
+
+        if response.status_code != 200:
+            raise RuntimeError(f"Ollama API error: {response.status_code} - {response.text}")
+
+        result = response.json()
+        return result.get("response", "")
     
     def generate(self, prompt: str, 
                 temperature: float = 0.7, 
@@ -89,56 +215,43 @@ class VLLMClient:
         Returns:
             生成的文本
         """
-        # 使用Chat API而不是completions API
-        # completions API会进行文本续写
-        # chat/completions API能更好地理解指令并生成独立的代码
-        url = f"{self.api_base}/v1/chat/completions"
-        
-        # 构建消息格式（Chat API所需）
-        messages = [
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
-        
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "top_p": top_p,
-        }
-        
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}"
-        }
-        
         try:
-            logger.info(f"Calling vLLM chat/completions... (max_tokens={max_tokens})")
-            response = requests.post(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=self.timeout
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                if result.get("choices") and len(result["choices"]) > 0:
-                    # Chat API返回的是message.content而不是text
-                    generated_text = result["choices"][0]["message"].get("content", "")
-                    logger.info(f"✓ Generated {len(generated_text)} chars")
-                    return generated_text
-            else:
-                logger.error(f"API error: {response.status_code} - {response.text}")
-                
+            # 初次未选中后端时尝试选择
+            if not self.active_backend:
+                self._check_connection()
+
+            # 优先走当前后端
+            if self.active_backend == 'ollama':
+                logger.info(f"Calling Ollama generate... (model={self.ollama_model}, max_tokens={max_tokens})")
+                generated_text = self._generate_ollama(prompt, temperature, max_tokens, top_p)
+                logger.info(f"✓ Generated {len(generated_text)} chars")
+                return generated_text
+
+            logger.info(f"Calling vLLM chat/completions... (model={self.model}, max_tokens={max_tokens})")
+            generated_text = self._generate_vllm(prompt, temperature, max_tokens, top_p)
+            logger.info(f"✓ Generated {len(generated_text)} chars")
+            return generated_text
+
         except requests.exceptions.Timeout:
             logger.error(f"Request timeout after {self.timeout}s")
         except requests.exceptions.RequestException as e:
             logger.error(f"Request failed: {e}")
-        
+        except Exception as e:
+            logger.error(f"Generation failed: {e}")
+
+        # vLLM失败且允许回退时，尝试Ollama
+        if self.allow_ollama_fallback and self.active_backend != 'ollama' and self._check_ollama_connection():
+            try:
+                logger.warning("vLLM generation failed, fallback to Ollama...")
+                self.active_backend = 'ollama'
+                self.active_api_base = self.ollama_api_base
+                self.active_model = self.ollama_model
+                generated_text = self._generate_ollama(prompt, temperature, max_tokens, top_p)
+                logger.info(f"✓ Generated {len(generated_text)} chars via Ollama fallback")
+                return generated_text
+            except Exception as e:
+                logger.error(f"Ollama fallback failed: {e}")
+
         return ""
     
     def chat_complete(self, messages: List[Dict[str, str]], 
@@ -171,6 +284,10 @@ class VLLMClient:
         }
         
         try:
+            if self.active_backend == 'ollama':
+                prompt = "\n".join([f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages])
+                return self._generate_ollama(prompt, temperature, max_tokens, top_p=0.95)
+
             logger.info("Calling vLLM chat API...")
             response = requests.post(
                 url,
@@ -178,7 +295,7 @@ class VLLMClient:
                 headers=headers,
                 timeout=self.timeout
             )
-            
+
             if response.status_code == 200:
                 result = response.json()
                 if result.get("choices") and len(result["choices"]) > 0:
@@ -187,7 +304,7 @@ class VLLMClient:
                     return content
             else:
                 logger.error(f"API error: {response.status_code}")
-                
+
         except Exception as e:
             logger.error(f"Chat request failed: {e}")
         

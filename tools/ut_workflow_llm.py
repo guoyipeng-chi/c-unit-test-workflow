@@ -9,6 +9,7 @@ import os
 import argparse
 import json
 import subprocess
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -151,6 +152,26 @@ class LLMUTWorkflow:
         llm_config = config.get('llm', {})
         llm_api_base = llm_config.get('api_base', 'http://localhost:8000')
         llm_model = llm_config.get('model', 'qwen-coder')
+
+        # 透传后端/Ollama配置到环境变量（仅在未显式设置环境变量时）
+        backend = llm_config.get('backend')
+        if backend and 'LLM_BACKEND' not in os.environ:
+            os.environ['LLM_BACKEND'] = str(backend)
+
+        if llm_config.get('timeout') is not None and 'VLLM_TIMEOUT' not in os.environ:
+            os.environ['VLLM_TIMEOUT'] = str(llm_config.get('timeout'))
+
+        ollama_config = llm_config.get('ollama', {})
+        if ollama_config.get('api_base') and 'OLLAMA_API_BASE' not in os.environ:
+            os.environ['OLLAMA_API_BASE'] = str(ollama_config.get('api_base'))
+        if ollama_config.get('model') and 'OLLAMA_MODEL' not in os.environ:
+            os.environ['OLLAMA_MODEL'] = str(ollama_config.get('model'))
+        if ollama_config.get('timeout') is not None and 'OLLAMA_TIMEOUT' not in os.environ:
+            os.environ['OLLAMA_TIMEOUT'] = str(ollama_config.get('timeout'))
+        if ollama_config.get('max_tokens') is not None and 'OLLAMA_MAX_TOKENS' not in os.environ:
+            os.environ['OLLAMA_MAX_TOKENS'] = str(ollama_config.get('max_tokens'))
+        if ollama_config.get('fallback_from_vllm') is not None and 'VLLM_FALLBACK_TO_OLLAMA' not in os.environ:
+            os.environ['VLLM_FALLBACK_TO_OLLAMA'] = str(ollama_config.get('fallback_from_vllm'))
         
         print(f"[Config] Loading from: {config_path}")
         print(f"[Config] Project root: {project_root}")
@@ -293,7 +314,10 @@ class LLMUTWorkflow:
                 content = f.read()
             
             # 检查必要的包含
-            has_gtest = '#include <gtest/gtest.h>' in content
+            has_gtest = (
+                '#include <gtest/gtest.h>' in content
+                or '#include "gtest/gtest.h"' in content
+            )
             has_tests = 'TEST(' in content or 'TEST_F(' in content
             has_assertions = 'EXPECT_' in content or 'ASSERT_' in content
             
@@ -392,6 +416,61 @@ class LLMUTWorkflow:
             or "ld returned 1 exit status" in lower and "cannot find -l" in lower
             or "library not found for -lgtest" in lower
         )
+
+    @staticmethod
+    def _detect_cpp_compiler() -> Optional[str]:
+        """检测可用的C++编译器，优先顺序适配Windows/Linux。"""
+        for compiler in ["g++", "clang++", "cl"]:
+            path = shutil.which(compiler)
+            if path:
+                return path
+        return None
+
+    @staticmethod
+    def _is_msvc_compiler(compiler_path: str) -> bool:
+        name = os.path.basename(compiler_path).lower()
+        return name in ("cl", "cl.exe")
+
+    def _build_compile_command(self,
+                               compiler_path: str,
+                               include_dirs: List[str],
+                               source_files: List[str],
+                               test_path: str,
+                               exe_path: str,
+                               gtest_link_inputs: List[str]) -> List[str]:
+        """按编译器类型构建编译命令。"""
+        if self._is_msvc_compiler(compiler_path):
+            cmd = [compiler_path, "/nologo", "/EHsc", "/std:c++14", f"/Fe:{exe_path}"]
+
+            for inc in include_dirs:
+                if inc.startswith("-I"):
+                    cmd.append(f"/I{inc[2:]}")
+
+            cmd.extend(source_files)
+            cmd.append(test_path)
+
+            for item in gtest_link_inputs:
+                if item.startswith("-l"):
+                    lib_name = item[2:]
+                    cmd.append(f"{lib_name}.lib")
+                else:
+                    cmd.append(item)
+
+            return cmd
+
+        # GCC/Clang 风格
+        cmd = [compiler_path, "-std=c++14", "-o", exe_path]
+        cmd.extend(include_dirs)
+        cmd.append("-I/usr/include/gtest")
+        cmd.extend(source_files)
+        cmd.append(test_path)
+        cmd.extend(gtest_link_inputs)
+
+        # Windows上使用MinGW可加上pthread，MSVC路径不需要
+        if os.name != 'nt':
+            cmd.append("-lpthread")
+
+        return cmd
     
     def run_tests(self, test_dir: Optional[str] = None,
                   build_dir: str = "build-test",
@@ -461,6 +540,13 @@ class LLMUTWorkflow:
                     source_files.append(os.path.join(root, file))
         
         print(f"Found {len(source_files)} source file(s)")
+
+        compiler_path = self._detect_cpp_compiler()
+        if not compiler_path:
+            print("✗ No C++ compiler found (expected one of: g++, clang++, cl)")
+            print("  Please install a compiler or run from a Developer Command Prompt.")
+            return False
+        print(f"[Build] Using compiler: {compiler_path}")
         
         # 尝试编译并运行每个测试文件
         all_passed = True
@@ -470,6 +556,8 @@ class LLMUTWorkflow:
             test_path = os.path.join(test_dir, test_file)
             test_name = os.path.splitext(test_file)[0]
             exe_path = os.path.join(build_path, test_name)
+            if self._is_msvc_compiler(compiler_path) and not exe_path.lower().endswith('.exe'):
+                exe_path += '.exe'
             
             print(f"\n[Test] {test_file}")
             print("-" * 40)
@@ -493,13 +581,15 @@ class LLMUTWorkflow:
                             include_dirs.append(include_flag)
             
             # 准备编译命令
-            compile_cmd = ["g++", "-std=c++14", "-o", exe_path]
-            compile_cmd.extend(include_dirs)
-            compile_cmd.append("-I/usr/include/gtest")
-            compile_cmd.extend(source_files)
-            compile_cmd.append(test_path)
-            compile_cmd.extend(self._resolve_gtest_link_inputs(include_dirs, build_path))
-            compile_cmd.extend(["-lpthread"])
+            gtest_link_inputs = self._resolve_gtest_link_inputs(include_dirs, build_path)
+            compile_cmd = self._build_compile_command(
+                compiler_path=compiler_path,
+                include_dirs=include_dirs,
+                source_files=source_files,
+                test_path=test_path,
+                exe_path=exe_path,
+                gtest_link_inputs=gtest_link_inputs
+            )
             
             try:
                 compile_result = None
@@ -705,7 +795,15 @@ Usage:
         self.analyze_codebase()
         self.print_compile_info()
         self.generate_tests(target_functions)
-        self.verify_tests()
+        verify_ok = self.verify_tests()
+
+        if not verify_ok:
+            print("\n⚠ Generated tests did not pass verification checks.")
+            print("  Skipping compile/run phase to avoid noisy failures.")
+            print("  Please review generated test files or improve prompt/model settings.")
+            print("\n" + "=" * 60)
+            print("✓ Workflow completed (generation only, verification failed).")
+            return
         
         if not skip_run:
             self.run_tests(

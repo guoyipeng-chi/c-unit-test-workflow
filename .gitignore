@@ -1,6 +1,7 @@
 build/
 build-ninja/
 build-ninja-msvc/
+build-test/
 __pycache__/
 
 # 环境变量配置（可能包含敏感信息）
