@@ -9,6 +9,8 @@ import json
 import logging
 import os
 import re
+import requests
+from urllib.parse import quote_plus
 from typing import Optional, Dict, List, Set, Any
 from dataclasses import dataclass
 from llm_client import VLLMClient
@@ -33,6 +35,101 @@ class LLMTestGenerator:
         self.llm = llm_client
         self.compile_analyzer = compile_analyzer
         self.system_prompt = self._build_system_prompt()
+
+    @staticmethod
+    def research_root_cause_online(root_cause: str,
+                                   error_type: str = "unknown",
+                                   key_symbols: Optional[List[str]] = None,
+                                   max_results: int = 4) -> Dict[str, Any]:
+        """基于triage根因做一次在线检索，返回可供修复参考的结果（失败自动降级）。"""
+        key_symbols = key_symbols or []
+        max_results = max(1, int(max_results or 4))
+
+        query_parts = [root_cause or "", error_type or "", "c++ gtest"] + key_symbols[:3]
+        query = " ".join([p for p in query_parts if p]).strip()
+        if not query:
+            query = "c++ gtest compile error"
+
+        references: List[Dict[str, str]] = []
+
+        try:
+            so_url = (
+                "https://api.stackexchange.com/2.3/search/advanced"
+                f"?order=desc&sort=relevance&site=stackoverflow&accepted=True&pagesize={max_results}"
+                f"&q={quote_plus(query)}"
+            )
+            so_resp = requests.get(so_url, timeout=8)
+            if so_resp.ok:
+                so_data = so_resp.json()
+                for item in (so_data.get("items") or [])[:max_results]:
+                    references.append({
+                        "source": "stackoverflow",
+                        "title": str(item.get("title", "")).strip(),
+                        "url": str(item.get("link", "")).strip(),
+                        "snippet": "Accepted/relevant StackOverflow thread"
+                    })
+        except Exception:
+            pass
+
+        try:
+            ddg_url = (
+                "https://api.duckduckgo.com/"
+                f"?q={quote_plus(query)}&format=json&no_redirect=1&no_html=1"
+            )
+            ddg_resp = requests.get(ddg_url, timeout=8)
+            if ddg_resp.ok:
+                ddg = ddg_resp.json()
+                abstract = str(ddg.get("AbstractText", "")).strip()
+                abstract_url = str(ddg.get("AbstractURL", "")).strip()
+                heading = str(ddg.get("Heading", "")).strip() or "DuckDuckGo abstract"
+                if abstract:
+                    references.append({
+                        "source": "duckduckgo",
+                        "title": heading,
+                        "url": abstract_url,
+                        "snippet": abstract[:280]
+                    })
+
+                related = ddg.get("RelatedTopics") or []
+                for topic in related:
+                    if len(references) >= max_results * 2:
+                        break
+                    if isinstance(topic, dict):
+                        text = str(topic.get("Text", "")).strip()
+                        url = str(topic.get("FirstURL", "")).strip()
+                        if text and url:
+                            references.append({
+                                "source": "duckduckgo",
+                                "title": "Related topic",
+                                "url": url,
+                                "snippet": text[:280]
+                            })
+        except Exception:
+            pass
+
+        dedup = []
+        seen_urls = set()
+        for ref in references:
+            url = ref.get("url", "")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            dedup.append(ref)
+            if len(dedup) >= max_results:
+                break
+
+        hints = []
+        for ref in dedup:
+            snippet = ref.get("snippet", "")
+            if snippet:
+                hints.append(snippet)
+
+        return {
+            "query": query,
+            "count": len(dedup),
+            "references": dedup,
+            "hints": hints[:max_results]
+        }
     
     def _build_system_prompt(self) -> str:
         """构建系统提示"""

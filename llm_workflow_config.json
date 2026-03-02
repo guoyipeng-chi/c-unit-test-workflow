@@ -59,6 +59,8 @@
       "max_test_fix_attempts": 2,
       "llm_triage_enabled": true,
       "triage_min_confidence": 0.55,
+      "web_research_enabled": true,
+      "web_research_max_results": 4,
       "comment": "quickstart/ut_workflow透传：编译失败与运行失败的自动修复开关/次数（独立计数），以及先LLM诊断再修复与最低置信度阈值"
     },
     "test_cases_per_function": {

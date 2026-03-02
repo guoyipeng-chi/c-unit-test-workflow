@@ -854,7 +854,9 @@ class LLMUTWorkflow:
                   auto_fix_test_failures: bool = True,
                   max_test_fix_attempts: int = 2,
                   llm_triage_enabled: bool = True,
-                  triage_min_confidence: float = 0.55) -> bool:
+                  triage_min_confidence: float = 0.55,
+                  web_research_enabled: bool = True,
+                  web_research_max_results: int = 4) -> bool:
         """
         编译并执行生成的测试用例
         
@@ -867,6 +869,8 @@ class LLMUTWorkflow:
             max_test_fix_attempts: 测试运行失败最大自动修复重试次数
             llm_triage_enabled: 是否启用“先分析再修复”诊断阶段
             triage_min_confidence: 触发修复的最低诊断置信度
+            web_research_enabled: triage后是否进行在线检索增强
+            web_research_max_results: 在线检索最多返回条数
             
         Returns:
             是否执行成功
@@ -1075,6 +1079,22 @@ class LLMUTWorkflow:
                                     function_name=test_name.replace("_llm_test", "")
                                 )
 
+                                if web_research_enabled:
+                                    try:
+                                        web_research = self.test_generator.research_root_cause_online(
+                                            root_cause=str(triage_result.get("root_cause", "")),
+                                            error_type=str(triage_result.get("error_type", "unknown")),
+                                            key_symbols=triage_result.get("key_symbols", []),
+                                            max_results=web_research_max_results
+                                        )
+                                        triage_result["web_research"] = web_research
+                                        print(
+                                            f"  [Research] query='{web_research.get('query', '')}', "
+                                            f"refs={web_research.get('count', 0)}"
+                                        )
+                                    except Exception as research_error:
+                                        print(f"  ⚠ Web research failed (compile triage): {research_error}")
+
                                 triage_conf = float(triage_result.get("confidence", 0.0) or 0.0)
                                 triage_type = str(triage_result.get("error_type", "unknown"))
                                 triage_cause = str(triage_result.get("root_cause", ""))
@@ -1206,6 +1226,22 @@ class LLMUTWorkflow:
                                 test_output=run_output,
                                 function_name=test_name.replace("_llm_test", "")
                             )
+
+                            if web_research_enabled:
+                                try:
+                                    web_research = self.test_generator.research_root_cause_online(
+                                        root_cause=str(runtime_triage_result.get("root_cause", "")),
+                                        error_type=str(runtime_triage_result.get("error_type", "unknown")),
+                                        key_symbols=runtime_triage_result.get("key_symbols", []),
+                                        max_results=web_research_max_results
+                                    )
+                                    runtime_triage_result["web_research"] = web_research
+                                    print(
+                                        f"  [Run-Research] query='{web_research.get('query', '')}', "
+                                        f"refs={web_research.get('count', 0)}"
+                                    )
+                                except Exception as research_error:
+                                    print(f"  ⚠ Web research failed (runtime triage): {research_error}")
 
                             triage_conf = float(runtime_triage_result.get("confidence", 0.0) or 0.0)
                             triage_type = str(runtime_triage_result.get("error_type", "unknown"))
@@ -1343,6 +1379,8 @@ Usage:
                           max_test_fix_attempts: int = 2,
                           llm_triage_enabled: bool = True,
                           triage_min_confidence: float = 0.55,
+                          web_research_enabled: bool = True,
+                          web_research_max_results: int = 4,
                           skip_quality_gates: bool = False,
                           quality_strict: bool = False) -> None:
         """
@@ -1357,6 +1395,8 @@ Usage:
             max_test_fix_attempts: 测试运行失败最大自动修复重试次数
             llm_triage_enabled: 是否启用“先分析再修复”诊断阶段
             triage_min_confidence: 诊断最低置信度阈值
+            web_research_enabled: triage后是否进行在线检索增强
+            web_research_max_results: 在线检索最大返回条数
             skip_quality_gates: 是否跳过clang-format/clang-tidy/cppcheck质量闸门
             quality_strict: 质量闸门严格模式（有问题即停止）
         """
@@ -1389,6 +1429,8 @@ Usage:
                 max_test_fix_attempts=max_test_fix_attempts,
                 llm_triage_enabled=llm_triage_enabled,
                 triage_min_confidence=triage_min_confidence
+                ,web_research_enabled=web_research_enabled,
+                web_research_max_results=web_research_max_results
             )
         
         print("\n" + "=" * 60)
@@ -1527,6 +1569,19 @@ def main():
     )
 
     parser.add_argument(
+        "--disable-web-research",
+        action="store_true",
+        help="Disable online root-cause research after triage"
+    )
+
+    parser.add_argument(
+        "--web-research-max-results",
+        type=int,
+        default=None,
+        help="Maximum web references to include for each triage"
+    )
+
+    parser.add_argument(
         "--skip-quality-gates",
         action="store_true",
         help="Skip quality gates (clang-format / clang-tidy / cppcheck)"
@@ -1548,6 +1603,8 @@ def main():
     effective_auto_fix_test_fail = not args.no_auto_fix_test_fail
     effective_llm_triage_enabled = not args.disable_llm_triage
     effective_triage_min_conf = args.triage_min_confidence if args.triage_min_confidence is not None else 0.55
+    effective_web_research_enabled = not args.disable_web_research
+    effective_web_research_max_results = args.web_research_max_results if args.web_research_max_results is not None else 4
     
     # 优先从配置文件加载
     if args.config:
@@ -1585,11 +1642,18 @@ def main():
                 effective_auto_fix_test_fail = False
             if not args.disable_llm_triage and compile_fix_cfg.get('llm_triage_enabled') is False:
                 effective_llm_triage_enabled = False
+            if not args.disable_web_research and compile_fix_cfg.get('web_research_enabled') is False:
+                effective_web_research_enabled = False
             if args.triage_min_confidence is None:
                 try:
                     effective_triage_min_conf = float(compile_fix_cfg.get('triage_min_confidence', 0.55))
                 except (TypeError, ValueError):
                     effective_triage_min_conf = 0.55
+            if args.web_research_max_results is None:
+                try:
+                    effective_web_research_max_results = int(compile_fix_cfg.get('web_research_max_results', 4))
+                except (TypeError, ValueError):
+                    effective_web_research_max_results = 4
         except Exception as e:
             print(f"✗ Failed to load config: {e}")
             sys.exit(1)
@@ -1627,6 +1691,8 @@ def main():
             max_test_fix_attempts=effective_max_test_fix_attempts,
             llm_triage_enabled=effective_llm_triage_enabled,
             triage_min_confidence=max(0.0, min(1.0, effective_triage_min_conf)),
+            web_research_enabled=effective_web_research_enabled,
+            web_research_max_results=max(1, effective_web_research_max_results),
             skip_quality_gates=effective_skip_quality_gates,
             quality_strict=effective_quality_strict
         )

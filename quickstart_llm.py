@@ -306,7 +306,9 @@ Then verify with:
                      auto_fix_compile_errors: Optional[bool] = None,
                      auto_fix_test_failures: Optional[bool] = None,
                      llm_triage_enabled: Optional[bool] = None,
-                     triage_min_confidence: Optional[float] = None) -> bool:
+                     triage_min_confidence: Optional[float] = None,
+                     web_research_enabled: Optional[bool] = None,
+                     web_research_max_results: Optional[int] = None) -> bool:
         """运行工作流"""
         print("\n[Run] Starting LLM UT Generation Workflow...")
         print("=" * 60)
@@ -390,6 +392,23 @@ Then verify with:
             cmd.append("--disable-llm-triage")
         cmd.extend(["--triage-min-confidence", f"{effective_triage_min_conf:.2f}"])
 
+        effective_web_research_enabled = compile_fix_cfg.get("web_research_enabled", True)
+        if web_research_enabled is not None:
+            effective_web_research_enabled = web_research_enabled
+
+        effective_web_research_max_results = compile_fix_cfg.get("web_research_max_results", 4)
+        try:
+            effective_web_research_max_results = int(effective_web_research_max_results)
+        except (TypeError, ValueError):
+            effective_web_research_max_results = 4
+        if web_research_max_results is not None:
+            effective_web_research_max_results = web_research_max_results
+        effective_web_research_max_results = max(1, effective_web_research_max_results)
+
+        if not effective_web_research_enabled:
+            cmd.append("--disable-web-research")
+        cmd.extend(["--web-research-max-results", str(effective_web_research_max_results)])
+
         # 从配置透传LLM后端与Ollama设置到子进程环境
         env = os.environ.copy()
         llm_cfg = self.config.get("llm", {})
@@ -452,7 +471,9 @@ Enter your choice (1-7):
                          auto_fix_compile_errors: Optional[bool] = None,
                          auto_fix_test_failures: Optional[bool] = None,
                          llm_triage_enabled: Optional[bool] = None,
-                         triage_min_confidence: Optional[float] = None) -> None:
+                         triage_min_confidence: Optional[float] = None,
+                         web_research_enabled: Optional[bool] = None,
+                         web_research_max_results: Optional[int] = None) -> None:
         """交互模式"""
         while True:
             self.show_menu()
@@ -476,7 +497,9 @@ Enter your choice (1-7):
                     auto_fix_compile_errors=auto_fix_compile_errors,
                     auto_fix_test_failures=auto_fix_test_failures,
                     llm_triage_enabled=llm_triage_enabled,
-                    triage_min_confidence=triage_min_confidence
+                    triage_min_confidence=triage_min_confidence,
+                    web_research_enabled=web_research_enabled,
+                    web_research_max_results=web_research_max_results
                 )
             elif choice == "5":
                 if not self.check_environment(prompt_install_compiler=True):
@@ -491,7 +514,9 @@ Enter your choice (1-7):
                     auto_fix_compile_errors=auto_fix_compile_errors,
                     auto_fix_test_failures=auto_fix_test_failures,
                     llm_triage_enabled=llm_triage_enabled,
-                    triage_min_confidence=triage_min_confidence
+                    triage_min_confidence=triage_min_confidence,
+                    web_research_enabled=web_research_enabled,
+                    web_research_max_results=web_research_max_results
                 )
             elif choice == "6":
                 if not self.check_environment(prompt_install_compiler=True):
@@ -507,7 +532,9 @@ Enter your choice (1-7):
                     auto_fix_compile_errors=auto_fix_compile_errors,
                     auto_fix_test_failures=auto_fix_test_failures,
                     llm_triage_enabled=llm_triage_enabled,
-                    triage_min_confidence=triage_min_confidence
+                    triage_min_confidence=triage_min_confidence,
+                    web_research_enabled=web_research_enabled,
+                    web_research_max_results=web_research_max_results
                 )
             elif choice == "7":
                 print("Goodbye!")
@@ -603,6 +630,19 @@ def main():
         default=None,
         help="Minimum triage confidence [0,1] required to apply LLM fix"
     )
+
+    parser.add_argument(
+        "--disable-web-research",
+        action="store_true",
+        help="Disable online root-cause research after triage"
+    )
+
+    parser.add_argument(
+        "--web-research-max-results",
+        type=int,
+        default=None,
+        help="Maximum number of web references used as fix context"
+    )
     
     args = parser.parse_args()
     
@@ -624,7 +664,9 @@ def main():
             auto_fix_compile_errors=(False if args.no_auto_fix_compile else None),
             auto_fix_test_failures=(False if args.no_auto_fix_test_fail else None),
             llm_triage_enabled=(False if args.disable_llm_triage else None),
-            triage_min_confidence=args.triage_min_confidence
+            triage_min_confidence=args.triage_min_confidence,
+            web_research_enabled=(False if args.disable_web_research else None),
+            web_research_max_results=args.web_research_max_results
         )
     
     # 命令行模式
@@ -655,7 +697,9 @@ def main():
             auto_fix_compile_errors=(False if args.no_auto_fix_compile else None),
             auto_fix_test_failures=(False if args.no_auto_fix_test_fail else None),
             llm_triage_enabled=(False if args.disable_llm_triage else None),
-            triage_min_confidence=args.triage_min_confidence
+            triage_min_confidence=args.triage_min_confidence,
+            web_research_enabled=(False if args.disable_web_research else None),
+            web_research_max_results=args.web_research_max_results
         ):
             sys.exit(0)
         else:
@@ -672,7 +716,9 @@ def main():
             auto_fix_compile_errors=(False if args.no_auto_fix_compile else None),
             auto_fix_test_failures=(False if args.no_auto_fix_test_fail else None),
             llm_triage_enabled=(False if args.disable_llm_triage else None),
-            triage_min_confidence=args.triage_min_confidence
+            triage_min_confidence=args.triage_min_confidence,
+            web_research_enabled=(False if args.disable_web_research else None),
+            web_research_max_results=args.web_research_max_results
         ):
             sys.exit(0)
         else:
