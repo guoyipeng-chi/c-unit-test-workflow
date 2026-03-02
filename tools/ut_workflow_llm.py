@@ -12,6 +12,7 @@ import subprocess
 import shutil
 import re
 import difflib
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -296,6 +297,180 @@ class LLMUTWorkflow:
         symbols = sorted({str(s).strip().lower() for s in key_symbols if str(s).strip()})
         symbols_sig = ",".join(symbols[:6])
         return f"{etype}|{cause}|{symbols_sig}"
+
+    @staticmethod
+    def _parse_gtest_xml_result(xml_path: str) -> Dict[str, object]:
+        result: Dict[str, object] = {
+            "xml_path": xml_path,
+            "exists": False,
+            "failed_tests": [],
+            "failure_locations": [],
+            "tests": 0,
+            "failures": 0,
+            "errors": 0
+        }
+        if not xml_path or (not os.path.exists(xml_path)):
+            return result
+
+        result["exists"] = True
+        try:
+            root = ET.parse(xml_path).getroot()
+            suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+            failed_tests: List[str] = []
+            failure_locations: List[Dict[str, object]] = []
+
+            tests = int(root.attrib.get("tests", 0) or 0)
+            failures = int(root.attrib.get("failures", 0) or 0)
+            errors = int(root.attrib.get("errors", 0) or 0)
+
+            for suite in suites:
+                suite_name = suite.attrib.get("name", "")
+                for case in suite.findall("testcase"):
+                    case_name = case.attrib.get("name", "")
+                    class_name = case.attrib.get("classname", "") or suite_name
+                    full_name = f"{class_name}.{case_name}" if class_name else case_name
+
+                    failure_nodes = list(case.findall("failure")) + list(case.findall("error"))
+                    if failure_nodes:
+                        failed_tests.append(full_name)
+
+                    for node in failure_nodes:
+                        message = (node.attrib.get("message", "") or (node.text or "")).strip()
+                        file_name = (node.attrib.get("file", "") or "").strip()
+                        line_no = node.attrib.get("line", "")
+                        line_val = int(line_no) if str(line_no).isdigit() else 1
+                        failure_locations.append({
+                            "test": full_name,
+                            "file": file_name.replace('\\', '/'),
+                            "line": line_val,
+                            "message": message[:300]
+                        })
+
+            result["failed_tests"] = sorted({t for t in failed_tests if t})
+            result["failure_locations"] = failure_locations[:20]
+            result["tests"] = tests
+            result["failures"] = failures
+            result["errors"] = errors
+            return result
+        except Exception as xml_error:
+            result["parse_error"] = str(xml_error)
+            return result
+
+    @staticmethod
+    def _extract_failed_tests_from_output(run_output: str) -> List[str]:
+        if not run_output:
+            return []
+        failed: List[str] = []
+        for line in run_output.splitlines():
+            match = re.search(r"\[\s*FAILED\s*\]\s+([A-Za-z0-9_\./:]+)", line)
+            if match:
+                name = match.group(1).strip()
+                if name and name not in failed:
+                    failed.append(name)
+        return failed
+
+    @staticmethod
+    def _extract_mock_violations(run_output: str, max_items: int = 6) -> List[Dict[str, str]]:
+        if not run_output:
+            return []
+
+        patterns = [
+            ("unexpected_call", r"Unexpected mock function call"),
+            ("uninteresting_call", r"Uninteresting mock function call"),
+            ("call_count_mismatch", r"Actual function call count doesn't match"),
+            ("call_overflow", r"called more times than expected"),
+            ("expectation_unmet", r"Expected:.*to be called"),
+            ("matcher_mismatch", r"Expected arg|Actual arg|which is"),
+        ]
+
+        violations: List[Dict[str, str]] = []
+        lines = run_output.splitlines()
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            for vtype, pattern in patterns:
+                if re.search(pattern, stripped, flags=re.IGNORECASE):
+                    context = " | ".join([
+                        lines[i].strip()
+                        for i in range(max(0, idx - 1), min(len(lines), idx + 2))
+                        if lines[i].strip()
+                    ])
+                    violations.append({
+                        "type": vtype,
+                        "message": stripped[:280],
+                        "context": context[:400]
+                    })
+                    break
+            if len(violations) >= max_items:
+                break
+        return violations
+
+    def _rerun_failed_tests_for_stability(self,
+                                          exe_path: str,
+                                          failed_tests: List[str],
+                                          log_dir: str,
+                                          test_name: str,
+                                          timestamp: str,
+                                          reruns: int = 2) -> Dict[str, object]:
+        failed_tests = [t for t in failed_tests if t]
+        if not failed_tests:
+            return {
+                "enabled": False,
+                "status": "no_failed_tests",
+                "reruns": 0,
+                "failed_count_each_run": []
+            }
+
+        reruns = max(1, int(reruns or 2))
+        filter_value = ":".join(failed_tests[:30])
+        failed_count_each_run: List[int] = []
+        run_details: List[Dict[str, object]] = []
+
+        for rerun_index in range(1, reruns + 1):
+            rerun_xml = os.path.join(
+                log_dir,
+                f"{test_name}_rerun{rerun_index}_{timestamp}.xml"
+            )
+            rerun_cmd = [exe_path, f"--gtest_filter={filter_value}", f"--gtest_output=xml:{rerun_xml}"]
+            rerun_result = subprocess.run(
+                rerun_cmd,
+                capture_output=True,
+                timeout=60,
+                text=True,
+                cwd=self.project_dir
+            )
+            rerun_output = (rerun_result.stdout or "") + "\n" + (rerun_result.stderr or "")
+            rerun_xml_summary = self._parse_gtest_xml_result(rerun_xml)
+            rerun_failed = rerun_xml_summary.get("failed_tests", []) or self._extract_failed_tests_from_output(rerun_output)
+            rerun_failed_count = len(rerun_failed)
+            failed_count_each_run.append(rerun_failed_count)
+
+            run_details.append({
+                "rerun_index": rerun_index,
+                "returncode": int(rerun_result.returncode),
+                "failed_tests": rerun_failed[:20],
+                "failed_count": rerun_failed_count,
+                "xml": rerun_xml
+            })
+
+        all_zero = all(count == 0 for count in failed_count_each_run)
+        all_nonzero = all(count > 0 for count in failed_count_each_run)
+        if all_zero:
+            stability = "not_reproducible"
+        elif all_nonzero:
+            stability = "stable_failure"
+        else:
+            stability = "flaky"
+
+        return {
+            "enabled": True,
+            "status": stability,
+            "reruns": reruns,
+            "filter": filter_value,
+            "failed_count_each_run": failed_count_each_run,
+            "details": run_details
+        }
     
     def analyze_codebase(self) -> None:
         """分析代码库"""
@@ -1369,8 +1544,12 @@ class LLMUTWorkflow:
                     print(f"  ✓ Compiled successfully")
                     self._print_key_event("Compile succeeded, entering test run", bg_code="42")
                     print(f"Running: {test_name}...")
+                    runtime_xml_path = os.path.join(
+                        log_dir,
+                        f"{test_name}_run_attempt{runtime_fix_count}_{timestamp}.xml"
+                    )
                     run_result = subprocess.run(
-                        [exe_path],
+                        [exe_path, f"--gtest_output=xml:{runtime_xml_path}"],
                         capture_output=True,
                         timeout=60,
                         text=True,
@@ -1428,6 +1607,44 @@ class LLMUTWorkflow:
                     }
 
                     run_output = (run_result.stdout or "") + "\n" + (run_result.stderr or "")
+                    runtime_xml_summary = self._parse_gtest_xml_result(runtime_xml_path)
+                    failed_tests = runtime_xml_summary.get("failed_tests", [])
+                    if not failed_tests:
+                        failed_tests = self._extract_failed_tests_from_output(run_output)
+
+                    rerun_summary = self._rerun_failed_tests_for_stability(
+                        exe_path=exe_path,
+                        failed_tests=failed_tests,
+                        log_dir=log_dir,
+                        test_name=test_name,
+                        timestamp=timestamp,
+                        reruns=2
+                    )
+                    mock_violations = self._extract_mock_violations(run_output)
+                    runtime_evidence = {
+                        "xml_summary": runtime_xml_summary,
+                        "failed_tests": failed_tests,
+                        "stability": rerun_summary,
+                        "mock_violations": mock_violations,
+                        "first_violation": (mock_violations[0] if mock_violations else None)
+                    }
+
+                    if failed_tests:
+                        self._print_key_event(
+                            f"[RuntimeEvidence] failed_cases={len(failed_tests)}",
+                            bg_code="45"
+                        )
+                    if rerun_summary.get("enabled"):
+                        self._print_key_event(
+                            f"[RuntimeEvidence] stability={rerun_summary.get('status', 'unknown')}",
+                            bg_code="45"
+                        )
+                    if mock_violations:
+                        self._print_key_event(
+                            f"[RuntimeEvidence] mock_violations={len(mock_violations)}",
+                            bg_code="45"
+                        )
+
                     if llm_triage_enabled:
                         try:
                             with open(test_path, 'r', encoding='utf-8') as f:
@@ -1443,7 +1660,8 @@ class LLMUTWorkflow:
                                 current_test_code=current_test_code,
                                 test_output=run_output,
                                 function_name=test_name.replace("_llm_test", ""),
-                                navigation_context=navigation_context
+                                navigation_context=navigation_context,
+                                runtime_evidence=runtime_evidence
                             )
 
                             enriched_navigation = self.compile_analyzer.build_ordered_navigation_context(
@@ -1454,6 +1672,7 @@ class LLMUTWorkflow:
                             runtime_triage_result["code_locations"] = enriched_navigation.get("code_locations", [])
                             runtime_triage_result["ordered_navigation"] = enriched_navigation.get("ordered_navigation", [])
                             runtime_triage_result["scope"] = enriched_navigation.get("scope", {})
+                            runtime_triage_result["runtime_evidence"] = runtime_evidence
 
                             if web_research_enabled:
                                 try:
@@ -1597,6 +1816,7 @@ class LLMUTWorkflow:
                                     "summary": str(runtime_triage_result.get("minimal_change", "runtime fix applied")),
                                     "code_locations": runtime_triage_result.get("code_locations", []),
                                     "change_direction": runtime_triage_result.get("change_direction", []),
+                                    "runtime_evidence": runtime_triage_result.get("runtime_evidence", runtime_evidence),
                                     "change_preview": self._summarize_code_change(before_fix_code, fixed_test_code),
                                     "outcome": "fix_applied_pending_rerun",
                                     "attempt": runtime_fix_count + 1

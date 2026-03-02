@@ -616,7 +616,8 @@ Do not introduce file locations outside this scope.
                              current_test_code: str,
                              test_output: str,
                                                          function_name: str = "unknown",
-                                                         navigation_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                     navigation_context: Optional[Dict[str, Any]] = None,
+                     runtime_evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """先诊断测试运行失败，返回结构化分析结果。"""
         prompt = f"""You are a senior C/C++ unit test debugging assistant.
 Analyze the test execution failure output and return a STRICT JSON object only.
@@ -642,6 +643,8 @@ Rules:
 - Keep test intent, use minimal edits
 - code_locations should prioritize provided navigation context and keep original order
 - change_direction should point to test-side edits only
+- If runtime evidence contains mock contract violations, prioritize the first violation as primary root cause
+- Use stability evidence (stable_failure/flaky/not_reproducible) to adjust confidence
 - Do NOT include markdown, comments, or extra text
 
 Target Function: {function_name}
@@ -667,6 +670,17 @@ Target Function: {function_name}
 
 Use this context to produce deterministic code_locations and ordered change_direction.
 Do not introduce file locations outside this scope.
+"""
+
+        if runtime_evidence:
+            prompt += f"""
+
+=== RUNTIME EVIDENCE (structured) ===
+```json
+{json.dumps(runtime_evidence, ensure_ascii=False, indent=2)}
+```
+
+Use this as high-priority evidence. Prefer first_violation for root cause when present.
 """
 
         logger.info(f"Triaging runtime test failure for {function_name}...")
