@@ -50,6 +50,9 @@ Guidelines:
 4. Include setup and teardown code when needed
 5. Add comments explaining complex test logic
 6. Ensure tests are independent and can run in any order
+7. NEVER define/re-implement production C functions in the test file.
+8. If using extern "C", only place #include and declarations there; do not put function bodies in extern "C" blocks.
+9. Use mocks/stubs declarations, not duplicate real function definitions from production sources.
 
 Return ONLY the C++ test code, no explanations."""
     
@@ -87,6 +90,10 @@ Return ONLY the C++ test code, no explanations."""
         
         # 清理响应（移除markdown标记等）
         test_code = self._clean_response(response)
+        test_code = self._sanitize_generated_test_code(
+            test_code,
+            forbidden_symbols=[func_dep.name] + sorted(list(func_dep.external_calls))
+        )
         
         return test_code
     
@@ -180,6 +187,11 @@ Make sure the tests are:
 - Using Google Test (gtest) framework
 - Using Google Mock (gmock) for mocking
 
+Critical constraints (must follow):
+- Do NOT implement/define production C functions in this test file.
+- The target function and other project C symbols must come from linked production object files.
+- If you need C linkage, use extern "C" only for includes/declarations, never for function bodies.
+
 Return ONLY the C++ code, no markdown wrappers."""
         
         return prompt
@@ -201,6 +213,84 @@ Return ONLY the C++ code, no markdown wrappers."""
         response = response.strip()
         
         return response
+
+    @staticmethod
+    def _remove_function_definitions(code: str, symbol_name: str) -> tuple[str, int]:
+        """
+        从代码中移除指定符号的函数定义（保留声明）。
+        通过匹配 `symbol(...) { ... }` 并按花括号配对删除。
+        """
+        removed = 0
+        search_pos = 0
+
+        pattern = re.compile(
+            rf'\b{re.escape(symbol_name)}\s*\([^;{{}}]*\)\s*\{{',
+            re.MULTILINE
+        )
+
+        while True:
+            match = pattern.search(code, search_pos)
+            if not match:
+                break
+
+            brace_open = code.find('{', match.end() - 1)
+            if brace_open == -1:
+                break
+
+            brace_count = 1
+            end_pos = brace_open + 1
+            while end_pos < len(code) and brace_count > 0:
+                ch = code[end_pos]
+                if ch == '{':
+                    brace_count += 1
+                elif ch == '}':
+                    brace_count -= 1
+                end_pos += 1
+
+            if brace_count != 0:
+                # 花括号不平衡，避免误删
+                search_pos = match.end()
+                continue
+
+            # 向前扩展到行首，尽量把返回类型一并删除
+            line_start = code.rfind('\n', 0, match.start())
+            line_start = 0 if line_start == -1 else line_start + 1
+
+            # 删除函数定义及其后可能紧跟的一个换行
+            delete_end = end_pos
+            if delete_end < len(code) and code[delete_end:delete_end + 1] == '\n':
+                delete_end += 1
+
+            code = code[:line_start] + code[delete_end:]
+            removed += 1
+            search_pos = line_start
+
+        return code, removed
+
+    def _sanitize_generated_test_code(self, code: str, forbidden_symbols: List[str]) -> str:
+        """移除模型误生成的生产函数定义，避免链接重复定义。"""
+        sanitized = code
+        total_removed = 0
+
+        # 去重保持顺序
+        seen = set()
+        symbols = []
+        for symbol in forbidden_symbols:
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                symbols.append(symbol)
+
+        for symbol in symbols:
+            sanitized, removed = self._remove_function_definitions(sanitized, symbol)
+            total_removed += removed
+
+        if total_removed > 0:
+            logger.warning(
+                f"Sanitized generated test: removed {total_removed} duplicated function definition(s) "
+                f"for symbols={symbols}"
+            )
+
+        return sanitized
 
     def fix_test_from_compile_error(self,
                                     current_test_code: str,
@@ -224,7 +314,8 @@ Requirements:
 1. Keep the same test intent and function target.
 2. Fix include errors, type/signature mismatches, mock declarations, and syntax errors.
 3. Keep using Google Test / Google Mock.
-4. Return ONLY the complete updated C++ test file.
+4. NEVER define/re-implement production C functions in test file.
+5. Return ONLY the complete updated C++ test file.
 
 Target Function: {function_name}
 
@@ -255,6 +346,8 @@ Target Function: {function_name}
         if not fixed_code.strip():
             logger.warning(f"Empty fixed code for {function_name}, keep original code")
             return current_test_code
+
+        fixed_code = self._sanitize_generated_test_code(fixed_code, forbidden_symbols=[function_name])
 
         return fixed_code
     
