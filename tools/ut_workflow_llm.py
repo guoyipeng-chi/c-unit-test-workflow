@@ -1125,7 +1125,9 @@ class LLMUTWorkflow:
                             "confidence": 1.0,
                             "fix_strategy": ["direct_fix"],
                             "key_symbols": [],
-                            "minimal_change": "apply minimal compile fix"
+                            "minimal_change": "apply minimal compile fix",
+                            "code_locations": [],
+                            "change_direction": ["apply minimal compile fix around first diagnostic location"]
                         }
 
                         if llm_triage_enabled:
@@ -1133,11 +1135,28 @@ class LLMUTWorkflow:
                                 with open(test_path, 'r', encoding='utf-8') as f:
                                     current_test_code = f.read()
 
+                                compile_output = (compile_result.stderr or compile_result.stdout or "")
+                                navigation_context = self.compile_analyzer.build_ordered_navigation_context(
+                                    compiler_output=compile_output,
+                                    key_symbols=[],
+                                    max_locations=8
+                                )
+
                                 triage_result = self.test_generator.analyze_compile_error(
                                     current_test_code=current_test_code,
-                                    compile_error=(compile_result.stderr or compile_result.stdout or ""),
-                                    function_name=test_name.replace("_llm_test", "")
+                                    compile_error=compile_output,
+                                    function_name=test_name.replace("_llm_test", ""),
+                                    navigation_context=navigation_context
                                 )
+
+                                enriched_navigation = self.compile_analyzer.build_ordered_navigation_context(
+                                    compiler_output=compile_output,
+                                    key_symbols=triage_result.get("key_symbols", []),
+                                    max_locations=8
+                                )
+                                triage_result["code_locations"] = enriched_navigation.get("code_locations", [])
+                                triage_result["ordered_navigation"] = enriched_navigation.get("ordered_navigation", [])
+                                triage_result["scope"] = enriched_navigation.get("scope", {})
 
                                 if web_research_enabled:
                                     try:
@@ -1176,6 +1195,14 @@ class LLMUTWorkflow:
                                 print(
                                     f"  [Triage] type={triage_type}, confidence={triage_conf:.2f}, cause={triage_cause}"
                                 )
+                                if triage_result.get("code_locations"):
+                                    first_loc = triage_result["code_locations"][0]
+                                    print(
+                                        f"  [Locate] {first_loc.get('file', '')}:{first_loc.get('line', 1)} "
+                                        f"({first_loc.get('kind', 'location')})"
+                                    )
+                                if triage_result.get("change_direction"):
+                                    print(f"  [Direction] {triage_result['change_direction'][0]}")
 
                                 triage_log_path = os.path.join(
                                     log_dir,
@@ -1234,6 +1261,8 @@ class LLMUTWorkflow:
                                         "key_symbols": triage_result.get("key_symbols", []),
                                         "fix_strategy": triage_result.get("fix_strategy", []),
                                         "summary": str(triage_result.get("minimal_change", "compile fix applied")),
+                                        "code_locations": triage_result.get("code_locations", []),
+                                        "change_direction": triage_result.get("change_direction", []),
                                         "change_preview": self._summarize_code_change(before_fix_code, fixed_test_code),
                                         "outcome": "fix_applied_pending_recompile",
                                         "attempt": llm_fix_count + 1
@@ -1307,7 +1336,9 @@ class LLMUTWorkflow:
                         "confidence": 1.0,
                         "fix_strategy": ["direct_fix"],
                         "key_symbols": [],
-                        "minimal_change": "apply minimal runtime fix"
+                        "minimal_change": "apply minimal runtime fix",
+                        "code_locations": [],
+                        "change_direction": ["apply minimal runtime test fix near first failing assertion"]
                     }
 
                     run_output = (run_result.stdout or "") + "\n" + (run_result.stderr or "")
@@ -1316,11 +1347,27 @@ class LLMUTWorkflow:
                             with open(test_path, 'r', encoding='utf-8') as f:
                                 current_test_code = f.read()
 
+                            navigation_context = self.compile_analyzer.build_ordered_navigation_context(
+                                compiler_output=run_output,
+                                key_symbols=[],
+                                max_locations=8
+                            )
+
                             runtime_triage_result = self.test_generator.analyze_test_failure(
                                 current_test_code=current_test_code,
                                 test_output=run_output,
-                                function_name=test_name.replace("_llm_test", "")
+                                function_name=test_name.replace("_llm_test", ""),
+                                navigation_context=navigation_context
                             )
+
+                            enriched_navigation = self.compile_analyzer.build_ordered_navigation_context(
+                                compiler_output=run_output,
+                                key_symbols=runtime_triage_result.get("key_symbols", []),
+                                max_locations=8
+                            )
+                            runtime_triage_result["code_locations"] = enriched_navigation.get("code_locations", [])
+                            runtime_triage_result["ordered_navigation"] = enriched_navigation.get("ordered_navigation", [])
+                            runtime_triage_result["scope"] = enriched_navigation.get("scope", {})
 
                             if web_research_enabled:
                                 try:
@@ -1359,6 +1406,14 @@ class LLMUTWorkflow:
                             print(
                                 f"  [Run-Triage] type={triage_type}, confidence={triage_conf:.2f}, cause={triage_cause}"
                             )
+                            if runtime_triage_result.get("code_locations"):
+                                first_loc = runtime_triage_result["code_locations"][0]
+                                print(
+                                    f"  [Run-Locate] {first_loc.get('file', '')}:{first_loc.get('line', 1)} "
+                                    f"({first_loc.get('kind', 'location')})"
+                                )
+                            if runtime_triage_result.get("change_direction"):
+                                print(f"  [Run-Direction] {runtime_triage_result['change_direction'][0]}")
 
                             triage_log_path = os.path.join(
                                 log_dir,
@@ -1425,6 +1480,8 @@ class LLMUTWorkflow:
                                     "key_symbols": runtime_triage_result.get("key_symbols", []),
                                     "fix_strategy": runtime_triage_result.get("fix_strategy", []),
                                     "summary": str(runtime_triage_result.get("minimal_change", "runtime fix applied")),
+                                    "code_locations": runtime_triage_result.get("code_locations", []),
+                                    "change_direction": runtime_triage_result.get("change_direction", []),
                                     "change_preview": self._summarize_code_change(before_fix_code, fixed_test_code),
                                     "outcome": "fix_applied_pending_rerun",
                                     "attempt": runtime_fix_count + 1

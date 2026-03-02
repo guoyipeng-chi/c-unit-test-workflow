@@ -511,7 +511,8 @@ Prefer proven fixes from similar past cases before trying novel changes.
     def analyze_compile_error(self,
                               current_test_code: str,
                               compile_error: str,
-                              function_name: str = "unknown") -> Dict[str, Any]:
+                                                            function_name: str = "unknown",
+                                                            navigation_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """先诊断编译错误，返回结构化分析结果。"""
         prompt = f"""You are a senior C/C++ build and test debugging assistant.
 Analyze the compile/link errors and return a STRICT JSON object only.
@@ -524,12 +525,18 @@ Output schema (all fields required):
   "confidence": 0.0,
   "fix_strategy": ["ordered actionable steps"],
   "key_symbols": ["symbol1", "symbol2"],
-  "minimal_change": "short patch guidance"
+    "minimal_change": "short patch guidance",
+    "code_locations": [
+        {{"file": "path", "line": 1, "column": 1, "symbol": "name", "reason": "why relevant"}}
+    ],
+    "change_direction": ["high-level edit direction"]
 }}
 
 Rules:
 - confidence is a float in [0,1]
 - Prefer minimal edits and preserving test intent
+- code_locations must prioritize provided navigation context and keep original order
+- change_direction should be concise, implementation-oriented (where + what to adjust)
 - Do NOT include markdown, comments, or extra text
 
 Target Function: {function_name}
@@ -543,6 +550,18 @@ Target Function: {function_name}
 ```
 {compile_error}
 ```
+"""
+
+        if navigation_context:
+            prompt += f"""
+
+=== SCOPED NAVIGATION CONTEXT (compile_commands.json constrained) ===
+```json
+{json.dumps(navigation_context, ensure_ascii=False, indent=2)}
+```
+
+Use this context to produce deterministic code_locations and ordered change_direction.
+Do not introduce file locations outside this scope.
 """
 
         logger.info(f"Triaging compile error for {function_name}...")
@@ -560,7 +579,9 @@ Target Function: {function_name}
             "confidence": 0.0,
             "fix_strategy": ["fallback_to_direct_fix"],
             "key_symbols": [],
-            "minimal_change": "apply minimal compile fix"
+            "minimal_change": "apply minimal compile fix",
+            "code_locations": [],
+            "change_direction": ["inspect compiler diagnostic location first, then adjust closest signature/include/mock mismatch"]
         }
 
         if not response:
@@ -584,13 +605,18 @@ Target Function: {function_name}
             result["fix_strategy"] = [str(result.get("fix_strategy", "fallback_to_direct_fix"))]
         if not isinstance(result.get("key_symbols"), list):
             result["key_symbols"] = []
+        if not isinstance(result.get("code_locations"), list):
+            result["code_locations"] = []
+        if not isinstance(result.get("change_direction"), list):
+            result["change_direction"] = [str(result.get("change_direction", "apply minimal compile fix"))]
 
         return result
 
     def analyze_test_failure(self,
                              current_test_code: str,
                              test_output: str,
-                             function_name: str = "unknown") -> Dict[str, Any]:
+                                                         function_name: str = "unknown",
+                                                         navigation_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """先诊断测试运行失败，返回结构化分析结果。"""
         prompt = f"""You are a senior C/C++ unit test debugging assistant.
 Analyze the test execution failure output and return a STRICT JSON object only.
@@ -603,13 +629,19 @@ Output schema (all fields required):
   "confidence": 0.0,
   "fix_strategy": ["ordered actionable steps"],
   "key_symbols": ["symbol1", "symbol2"],
-  "minimal_change": "short patch guidance"
+    "minimal_change": "short patch guidance",
+    "code_locations": [
+        {{"file": "path", "line": 1, "column": 1, "symbol": "name", "reason": "why relevant"}}
+    ],
+    "change_direction": ["high-level edit direction"]
 }}
 
 Rules:
 - confidence is a float in [0,1]
 - Assume production code is correct; adjust test only
 - Keep test intent, use minimal edits
+- code_locations should prioritize provided navigation context and keep original order
+- change_direction should point to test-side edits only
 - Do NOT include markdown, comments, or extra text
 
 Target Function: {function_name}
@@ -623,6 +655,18 @@ Target Function: {function_name}
 ```
 {test_output}
 ```
+"""
+
+        if navigation_context:
+            prompt += f"""
+
+=== SCOPED NAVIGATION CONTEXT (compile_commands.json constrained) ===
+```json
+{json.dumps(navigation_context, ensure_ascii=False, indent=2)}
+```
+
+Use this context to produce deterministic code_locations and ordered change_direction.
+Do not introduce file locations outside this scope.
 """
 
         logger.info(f"Triaging runtime test failure for {function_name}...")
@@ -640,7 +684,9 @@ Target Function: {function_name}
             "confidence": 0.0,
             "fix_strategy": ["fallback_to_direct_fix"],
             "key_symbols": [],
-            "minimal_change": "apply minimal runtime fix"
+            "minimal_change": "apply minimal runtime fix",
+            "code_locations": [],
+            "change_direction": ["open failing assertion/expectation location first, then align expected values or mock behavior"]
         }
 
         if not response:
@@ -664,6 +710,10 @@ Target Function: {function_name}
             result["fix_strategy"] = [str(result.get("fix_strategy", "fallback_to_direct_fix"))]
         if not isinstance(result.get("key_symbols"), list):
             result["key_symbols"] = []
+        if not isinstance(result.get("code_locations"), list):
+            result["code_locations"] = []
+        if not isinstance(result.get("change_direction"), list):
+            result["change_direction"] = [str(result.get("change_direction", "apply minimal runtime fix"))]
 
         return result
 

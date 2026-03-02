@@ -10,7 +10,7 @@ import re
 import os
 import logging
 from dataclasses import dataclass
-from typing import List, Dict, Set, Optional
+from typing import List, Dict, Set, Optional, Any
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -86,6 +86,261 @@ class CompileCommandsAnalyzer:
             file = cmd_entry.get("file", "")
             if file:
                 self.compile_info[file] = self._analyze_command(cmd_entry)
+
+    def _to_abs_path(self, path: str, base_dir: Optional[str] = None) -> str:
+        """将路径转换为绝对规范路径。"""
+        if not path:
+            return ""
+
+        normalized = os.path.normpath(path)
+        if os.path.isabs(normalized):
+            return os.path.abspath(normalized)
+
+        base = base_dir or self.project_root or os.getcwd()
+        return os.path.abspath(os.path.join(base, normalized))
+
+    def get_compile_scope_files(self) -> List[str]:
+        """返回compile_commands.json覆盖的源文件绝对路径集合。"""
+        files: Set[str] = set()
+        for info in self.compile_info.values():
+            abs_file = self._to_abs_path(info.file, info.directory)
+            if abs_file:
+                files.add(abs_file)
+        return sorted(files)
+
+    @staticmethod
+    def _relativize(path: str, root: str) -> str:
+        """将绝对路径转换为相对项目路径（失败时回退原路径）。"""
+        try:
+            rel = os.path.relpath(path, root)
+            if not rel.startswith(".."):
+                return rel.replace('\\', '/')
+        except Exception:
+            pass
+        return path.replace('\\', '/')
+
+    def _extract_error_locations(self,
+                                 compiler_output: str,
+                                 scope_files: Set[str],
+                                 max_hits: int = 6) -> List[Dict[str, Any]]:
+        """从编译器输出中提取定位点，仅保留compile scope内文件。"""
+        if not compiler_output:
+            return []
+
+        results: List[Dict[str, Any]] = []
+        seen = set()
+
+        patterns = [
+            # clang/gcc: path:line:col:
+            r'([A-Za-z]:[^:\n]+|[^:\n]+):(\d+):(\d+):',
+            # msvc: path(line,col)
+            r'([A-Za-z]:[^\(\n]+|[^\(\n]+)\((\d+),(\d+)\)',
+        ]
+
+        for pattern in patterns:
+            for match in re.finditer(pattern, compiler_output):
+                raw_path = (match.group(1) or "").strip().strip('"')
+                line_no = int(match.group(2)) if match.group(2) else 1
+                col_no = int(match.group(3)) if match.group(3) else 1
+
+                abs_path = self._to_abs_path(raw_path)
+                if abs_path not in scope_files:
+                    continue
+
+                key = (abs_path, line_no, col_no)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                results.append({
+                    "kind": "compiler_diagnostic",
+                    "symbol": "",
+                    "file": self._relativize(abs_path, self.project_root),
+                    "line": line_no,
+                    "column": col_no,
+                    "reason": "compile diagnostic location"
+                })
+
+                if len(results) >= max_hits:
+                    return results
+
+        return results
+
+    def _find_symbol_locations_with_clang(self,
+                                          symbol: str,
+                                          scope_files: List[str],
+                                          max_hits_per_symbol: int = 2) -> List[Dict[str, Any]]:
+        """使用libclang在compile scope中查找符号声明/定义位置。"""
+        if (not symbol) or (not self.use_clang) or (not self.clang_index):
+            return []
+
+        results: List[Dict[str, Any]] = []
+
+        for source_file in scope_files:
+            info = None
+            # compile_info的key可能是相对路径，逐一比对绝对路径
+            for compile_info in self.compile_info.values():
+                compile_file_abs = self._to_abs_path(compile_info.file, compile_info.directory)
+                if compile_file_abs == source_file:
+                    info = compile_info
+                    break
+
+            if not info:
+                continue
+
+            args: List[str] = []
+            for inc_dir in info.include_dirs:
+                args.append(f"-I{inc_dir}")
+            for name, value in info.defines.items():
+                if value:
+                    args.append(f"-D{name}={value}")
+                else:
+                    args.append(f"-D{name}")
+            if info.c_standard:
+                args.append(f"-std={info.c_standard}")
+
+            try:
+                tu = self.clang_index.parse(source_file, args=args)
+            except Exception:
+                continue
+
+            found_for_file = 0
+            for cursor in tu.cursor.walk_preorder():
+                spelling = (cursor.spelling or "").strip()
+                if spelling != symbol:
+                    continue
+
+                location = cursor.location
+                if not location or not location.file:
+                    continue
+
+                loc_file_abs = self._to_abs_path(str(location.file.name))
+                if loc_file_abs not in scope_files:
+                    continue
+
+                is_definition = bool(getattr(cursor, "is_definition", lambda: False)())
+                results.append({
+                    "kind": "symbol_definition" if is_definition else "symbol_declaration",
+                    "symbol": symbol,
+                    "file": self._relativize(loc_file_abs, self.project_root),
+                    "line": int(location.line or 1),
+                    "column": int(location.column or 1),
+                    "reason": "clang navigation in compile_commands scope"
+                })
+                found_for_file += 1
+                if found_for_file >= max_hits_per_symbol:
+                    break
+
+            if len(results) >= max_hits_per_symbol:
+                break
+
+        return results
+
+    def _find_symbol_locations_fallback(self,
+                                        symbol: str,
+                                        scope_files: List[str],
+                                        max_hits_per_symbol: int = 2) -> List[Dict[str, Any]]:
+        """在clang不可用时，按compile scope做有限正则定位。"""
+        if not symbol:
+            return []
+
+        results: List[Dict[str, Any]] = []
+        pattern = re.compile(rf'\b{re.escape(symbol)}\b')
+
+        for source_file in scope_files:
+            if not os.path.exists(source_file):
+                continue
+            try:
+                with open(source_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    for idx, line in enumerate(f, start=1):
+                        if pattern.search(line):
+                            col = max(1, line.find(symbol) + 1)
+                            results.append({
+                                "kind": "symbol_reference",
+                                "symbol": symbol,
+                                "file": self._relativize(source_file, self.project_root),
+                                "line": idx,
+                                "column": col,
+                                "reason": "fallback scoped regex location"
+                            })
+                            if len(results) >= max_hits_per_symbol:
+                                return results
+            except Exception:
+                continue
+
+        return results
+
+    def build_ordered_navigation_context(self,
+                                         compiler_output: str,
+                                         key_symbols: Optional[List[str]] = None,
+                                         max_locations: int = 8) -> Dict[str, Any]:
+        """
+        构建受compile_commands约束的定位上下文：
+        1) 先诊断点
+        2) 再符号声明/定义点（优先clang）
+        """
+        key_symbols = [s for s in (key_symbols or []) if isinstance(s, str) and s.strip()]
+        max_locations = max(1, int(max_locations or 8))
+
+        scope_list = self.get_compile_scope_files()
+        scope_set = set(scope_list)
+
+        locations: List[Dict[str, Any]] = []
+        locations.extend(self._extract_error_locations(compiler_output, scope_set, max_hits=max_locations))
+
+        for symbol in key_symbols[:6]:
+            symbol = symbol.strip()
+            if not symbol:
+                continue
+
+            if self.use_clang and self.clang_index:
+                sym_locs = self._find_symbol_locations_with_clang(
+                    symbol=symbol,
+                    scope_files=scope_list,
+                    max_hits_per_symbol=2
+                )
+            else:
+                sym_locs = self._find_symbol_locations_fallback(
+                    symbol=symbol,
+                    scope_files=scope_list,
+                    max_hits_per_symbol=2
+                )
+
+            for loc in sym_locs:
+                duplicate = any(
+                    loc["file"] == existing.get("file")
+                    and int(loc["line"]) == int(existing.get("line", 0))
+                    and (loc.get("symbol", "") == existing.get("symbol", ""))
+                    for existing in locations
+                )
+                if not duplicate:
+                    locations.append(loc)
+                if len(locations) >= max_locations:
+                    break
+            if len(locations) >= max_locations:
+                break
+
+        ordered_navigation: List[Dict[str, Any]] = []
+        for index, loc in enumerate(locations, start=1):
+            ordered_navigation.append({
+                "step": index,
+                "action": "open_file_at",
+                "file": loc.get("file", ""),
+                "line": int(loc.get("line", 1) or 1),
+                "column": int(loc.get("column", 1) or 1),
+                "focus": loc.get("symbol") or loc.get("kind", "location"),
+                "reason": loc.get("reason", "")
+            })
+
+        return {
+            "scope": {
+                "source": "compile_commands.json",
+                "total_files": len(scope_list),
+                "clang_navigation": bool(self.use_clang and self.clang_index)
+            },
+            "code_locations": locations[:max_locations],
+            "ordered_navigation": ordered_navigation[:max_locations]
+        }
     
     def extract_all_includes(self, source_file: str, compile_info: Optional[CompileInfo] = None) -> Set[str]:
         """
