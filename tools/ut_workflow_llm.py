@@ -246,6 +246,30 @@ class LLMUTWorkflow:
         return preview
 
     @staticmethod
+    def _ansi_enabled() -> bool:
+        if os.environ.get("NO_COLOR"):
+            return False
+        term = (os.environ.get("TERM") or "").lower()
+        if term == "dumb":
+            return False
+        return True
+
+    @classmethod
+    def _with_bg(cls, text: str, bg_code: str = "44", fg_code: str = "97") -> str:
+        if not cls._ansi_enabled():
+            return text
+        return f"\033[{bg_code};{fg_code}m{text}\033[0m"
+
+    @classmethod
+    def _print_key_node(cls, title: str, bg_code: str = "44") -> None:
+        tag = f"  {title}  "
+        print(cls._with_bg(tag, bg_code=bg_code, fg_code="97"))
+
+    @classmethod
+    def _print_key_event(cls, text: str, bg_code: str = "46") -> None:
+        print(cls._with_bg(f" {text} ", bg_code=bg_code, fg_code="30"))
+
+    @staticmethod
     def _normalize_issue_text(text: str) -> str:
         normalized = re.sub(r'\s+', ' ', (text or '').strip().lower())
         return normalized[:240]
@@ -275,7 +299,7 @@ class LLMUTWorkflow:
     
     def analyze_codebase(self) -> None:
         """分析代码库"""
-        print("\n[Step 1/4] Analyzing C codebase...")
+        self._print_key_node("[Step 1/4] Analyzing C codebase", bg_code="44")
         print("=" * 60)
         
         # 分析所有源文件
@@ -300,7 +324,7 @@ class LLMUTWorkflow:
     
     def print_compile_info(self) -> None:
         """打印编译信息"""
-        print("\n[Step 2/4] Extracting compile information...")
+        self._print_key_node("[Step 2/4] Extracting compile information", bg_code="44")
         print("=" * 60)
         
         self.compile_analyzer.print_summary()
@@ -317,7 +341,7 @@ class LLMUTWorkflow:
         Returns:
             {函数名: 测试代码}
         """
-        print("\n[Step 3/4] Generating tests with LLM...")
+        self._print_key_node("[Step 3/4] Generating tests with LLM", bg_code="44")
         print("=" * 60)
         
         if output_dir is None:
@@ -376,7 +400,7 @@ class LLMUTWorkflow:
     
     def verify_tests(self, test_dir: Optional[str] = None) -> bool:
         """验证生成的测试（基本的语法检查）"""
-        print("\n[Step 4/4] Verifying generated tests...")
+        self._print_key_node("[Step 4/4] Verifying generated tests", bg_code="44")
         print("=" * 60)
         
         if test_dir is None:
@@ -963,7 +987,7 @@ class LLMUTWorkflow:
         Returns:
             是否执行成功
         """
-        print("\n[Step 5/5] Compiling and running tests...")
+        self._print_key_node("[Step 5/5] Compiling and running tests", bg_code="45")
         print("=" * 60)
         
         if test_dir is None:
@@ -1034,7 +1058,7 @@ class LLMUTWorkflow:
             if self._is_msvc_compiler(compiler_path) and not exe_path.lower().endswith('.exe'):
                 exe_path += '.exe'
             
-            print(f"\n[Test] {test_file}")
+            self._print_key_node(f"[Test] {test_file}", bg_code="100")
             print("-" * 40)
             
             # 构建编译命令
@@ -1141,6 +1165,7 @@ class LLMUTWorkflow:
                                 continue
 
                         if self._is_toolchain_link_error(compile_result.stderr or ""):
+                            self._print_key_event("⚠ Linker/toolchain issue detected", bg_code="43")
                             print("  ⚠ Linker/toolchain error detected (e.g. missing gtest library).")
                             print("    Skipping LLM code-fix because this is not a test code issue.")
                             break
@@ -1266,20 +1291,23 @@ class LLMUTWorkflow:
 
                         if llm_fix_count >= max_fix_attempts:
                             if is_new_issue:
-                                print(
-                                    "  [RetryPolicy] New compile issue detected after retry budget; "
-                                    "allowing extra fix round."
+                                self._print_key_event(
+                                    "[RetryPolicy] New compile issue after budget -> continue",
+                                    bg_code="42"
                                 )
                             else:
-                                print(
-                                    "  [RetryPolicy] Compile retry budget reached and issue repeated; "
-                                    "stopping auto-fix."
+                                self._print_key_event(
+                                    "[RetryPolicy] Repeated compile issue after budget -> stop",
+                                    bg_code="41"
                                 )
                                 break
 
                         compile_seen_issue_fingerprints.add(issue_fingerprint)
 
-                        print(f"  [Fix] Entering auto-fix phase ({llm_fix_count + 1}/{max_fix_attempts})...")
+                        self._print_key_event(
+                            f"[Fix] Compile auto-fix phase ({llm_fix_count + 1}/{max_fix_attempts})",
+                            bg_code="46"
+                        )
                         try:
                             with open(test_path, 'r', encoding='utf-8') as f:
                                 current_test_code = f.read()
@@ -1339,6 +1367,7 @@ class LLMUTWorkflow:
                         continue
 
                     print(f"  ✓ Compiled successfully")
+                    self._print_key_event("Compile succeeded, entering test run", bg_code="42")
                     print(f"Running: {test_name}...")
                     run_result = subprocess.run(
                         [exe_path],
@@ -1360,6 +1389,7 @@ class LLMUTWorkflow:
                         continue
 
                     print(f"  ✗ Some tests failed")
+                    self._print_key_event("Runtime tests failed, preparing triage", bg_code="43")
                     if run_result.stderr:
                         error_lines = run_result.stderr.split('\n')
                         for line in error_lines:
@@ -1505,14 +1535,14 @@ class LLMUTWorkflow:
 
                     if runtime_fix_count >= max_test_fix_attempts:
                         if runtime_is_new_issue:
-                            print(
-                                "  [RetryPolicy] New runtime issue detected after retry budget; "
-                                "allowing extra fix round."
+                            self._print_key_event(
+                                "[RetryPolicy] New runtime issue after budget -> continue",
+                                bg_code="42"
                             )
                         else:
-                            print(
-                                "  [RetryPolicy] Runtime retry budget reached and issue repeated; "
-                                "stopping auto-fix."
+                            self._print_key_event(
+                                "[RetryPolicy] Repeated runtime issue after budget -> stop",
+                                bg_code="41"
                             )
                             results.append((test_name, "FAILED"))
                             all_passed = False
@@ -1521,8 +1551,9 @@ class LLMUTWorkflow:
 
                     runtime_seen_issue_fingerprints.add(runtime_issue_fingerprint)
 
-                    print(
-                        f"  [Fix] Entering runtime auto-fix phase ({runtime_fix_count + 1}/{max_test_fix_attempts})..."
+                    self._print_key_event(
+                        f"[Fix] Runtime auto-fix phase ({runtime_fix_count + 1}/{max_test_fix_attempts})",
+                        bg_code="46"
                     )
                     try:
                         with open(test_path, 'r', encoding='utf-8') as f:
@@ -1605,7 +1636,7 @@ class LLMUTWorkflow:
         
         # 显示总结
         print("\n" + "=" * 60)
-        print("Test Execution Summary")
+        self._print_key_node("Test Execution Summary", bg_code="44")
         print("=" * 60)
         
         for test_name, status in results:
@@ -1613,9 +1644,9 @@ class LLMUTWorkflow:
             print(f"{status_symbol} {test_name:<40} {status}")
         
         if all_passed:
-            print("\n✓ All tests executed successfully!")
+            self._print_key_event("✓ All tests executed successfully", bg_code="42")
         else:
-            print("\n⚠ Some tests failed or couldn't run")
+            self._print_key_event("⚠ Some tests failed or couldn't run", bg_code="43")
         
         return all_passed
 
@@ -1711,7 +1742,7 @@ Usage:
             )
         
         print("\n" + "=" * 60)
-        print("✓ Workflow completed!")
+        self._print_key_node("✓ Workflow completed", bg_code="42")
 
 
 class CCodeAnalyzer:
