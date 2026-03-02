@@ -445,7 +445,7 @@ Target Function: {function_name}
         response = self.llm.generate(
             prompt,
             temperature=0.1,
-            max_tokens=1024,
+            max_tokens=5000,
             top_p=0.9
         )
 
@@ -482,6 +482,148 @@ Target Function: {function_name}
             result["key_symbols"] = []
 
         return result
+
+    def analyze_test_failure(self,
+                             current_test_code: str,
+                             test_output: str,
+                             function_name: str = "unknown") -> Dict[str, Any]:
+        """先诊断测试运行失败，返回结构化分析结果。"""
+        prompt = f"""You are a senior C/C++ unit test debugging assistant.
+Analyze the test execution failure output and return a STRICT JSON object only.
+
+Output schema (all fields required):
+{{
+  "error_type": "assertion|expectation|mock|state|data|flaky|unknown",
+  "root_cause": "short cause summary",
+  "should_fix": true,
+  "confidence": 0.0,
+  "fix_strategy": ["ordered actionable steps"],
+  "key_symbols": ["symbol1", "symbol2"],
+  "minimal_change": "short patch guidance"
+}}
+
+Rules:
+- confidence is a float in [0,1]
+- Assume production code is correct; adjust test only
+- Keep test intent, use minimal edits
+- Do NOT include markdown, comments, or extra text
+
+Target Function: {function_name}
+
+=== CURRENT TEST CODE ===
+```cpp
+{current_test_code}
+```
+
+=== TEST OUTPUT ===
+```
+{test_output}
+```
+"""
+
+        logger.info(f"Triaging runtime test failure for {function_name}...")
+        response = self.llm.generate(
+            prompt,
+            temperature=0.1,
+            max_tokens=5000,
+            top_p=0.9
+        )
+
+        default_result: Dict[str, Any] = {
+            "error_type": "unknown",
+            "root_cause": "triage_unavailable",
+            "should_fix": True,
+            "confidence": 0.0,
+            "fix_strategy": ["fallback_to_direct_fix"],
+            "key_symbols": [],
+            "minimal_change": "apply minimal runtime fix"
+        }
+
+        if not response:
+            return default_result
+
+        parsed = self._extract_json_object(response)
+        if not parsed:
+            return default_result
+
+        result = default_result.copy()
+        result.update(parsed)
+
+        try:
+            result["confidence"] = float(result.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            result["confidence"] = 0.0
+        result["confidence"] = max(0.0, min(1.0, result["confidence"]))
+        result["should_fix"] = bool(result.get("should_fix", True))
+
+        if not isinstance(result.get("fix_strategy"), list):
+            result["fix_strategy"] = [str(result.get("fix_strategy", "fallback_to_direct_fix"))]
+        if not isinstance(result.get("key_symbols"), list):
+            result["key_symbols"] = []
+
+        return result
+
+    def fix_test_from_test_failure(self,
+                                   current_test_code: str,
+                                   test_output: str,
+                                   function_name: str = "unknown",
+                                   failure_analysis: Optional[Dict[str, Any]] = None) -> str:
+        """根据测试运行失败输出修复测试代码（假设被测代码正确）。"""
+        prompt = f"""You are an expert C/C++ unit test engineer.
+Fix the following Google Test file based on TEST EXECUTION failures.
+
+Requirements:
+1. Assume production code is correct; only modify tests.
+2. Keep test intent and target function unchanged.
+3. Fix assertions, expected values, mock expectations, fixture setup/reset, and test data.
+4. Keep using Google Test / Google Mock.
+5. NEVER define/re-implement production C functions in test file.
+6. Preserve exact production signatures from headers.
+7. Return ONLY the complete updated C++ test file.
+
+Target Function: {function_name}
+
+=== CURRENT TEST CODE ===
+```cpp
+{current_test_code}
+```
+
+=== TEST OUTPUT ===
+```
+{test_output}
+```
+"""
+
+        if failure_analysis:
+            prompt += f"""
+
+=== DIAGNOSTIC ANALYSIS (from previous triage step) ===
+```json
+{json.dumps(failure_analysis, ensure_ascii=False, indent=2)}
+```
+
+Use this analysis as primary guidance and perform minimal, targeted changes.
+"""
+
+        logger.info(f"Fixing runtime test failure for {function_name}...")
+        response = self.llm.generate(
+            prompt,
+            temperature=0.2,
+            max_tokens=64000,
+            top_p=0.9
+        )
+
+        if not response:
+            logger.warning(f"Failed to fix runtime test for {function_name}, keep original code")
+            return current_test_code
+
+        fixed_code = self._clean_response(response)
+        if not fixed_code.strip():
+            logger.warning(f"Empty runtime fixed code for {function_name}, keep original code")
+            return current_test_code
+
+        fixed_code = self._sanitize_generated_test_code(fixed_code, forbidden_symbols=[function_name])
+        return fixed_code
     
     def _generate_fallback_test(self, func_dep: FunctionDependency) -> str:
         """生成备选测试代码"""

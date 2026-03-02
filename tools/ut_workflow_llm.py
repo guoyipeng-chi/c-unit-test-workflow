@@ -851,6 +851,8 @@ class LLMUTWorkflow:
                   build_dir: str = "build-test",
                   auto_fix_compile_errors: bool = True,
                   max_fix_attempts: int = 2,
+                  auto_fix_test_failures: bool = True,
+                  max_test_fix_attempts: int = 2,
                   llm_triage_enabled: bool = True,
                   triage_min_confidence: float = 0.55) -> bool:
         """
@@ -861,6 +863,8 @@ class LLMUTWorkflow:
             build_dir: 测试编译目录
             auto_fix_compile_errors: 编译失败后是否自动进入LLM修复阶段
             max_fix_attempts: 最大自动修复重试次数
+            auto_fix_test_failures: 测试运行失败后是否自动进入LLM修复阶段
+            max_test_fix_attempts: 测试运行失败最大自动修复重试次数
             llm_triage_enabled: 是否启用“先分析再修复”诊断阶段
             triage_min_confidence: 触发修复的最低诊断置信度
             
@@ -978,204 +982,300 @@ class LLMUTWorkflow:
             
             try:
                 compile_result = None
-                compile_success = False
-
-                compile_round = 0
                 llm_fix_count = 0
+                runtime_fix_count = 0
+                compile_round = 0
                 max_compile_rounds = max_fix_attempts + 2
+                test_finished = False
 
-                while compile_round < max_compile_rounds:
-                    if compile_round == 0:
-                        print(f"Compiling: {test_name}...")
-                    else:
-                        print(
-                            f"Compiling after retry {compile_round}/{max_compile_rounds - 1}: {test_name}..."
+                while not test_finished:
+                    compile_success = False
+
+                    while compile_round < max_compile_rounds:
+                        if compile_round == 0:
+                            print(f"Compiling: {test_name}...")
+                        else:
+                            print(
+                                f"Compiling after retry {compile_round}/{max_compile_rounds - 1}: {test_name}..."
+                            )
+
+                        compile_result = subprocess.run(
+                            compile_cmd,
+                            capture_output=True,
+                            timeout=120,
+                            text=True,
+                            cwd=self.project_dir
                         )
 
-                    compile_result = subprocess.run(
-                        compile_cmd,
-                        capture_output=True,
-                        timeout=120,
-                        text=True,
-                        cwd=self.project_dir
-                    )
+                        if compile_result.returncode == 0:
+                            compile_success = True
+                            break
 
-                    if compile_result.returncode == 0:
-                        compile_success = True
-                        break
+                        print(f"  ✗ Compilation failed")
+                        if compile_result.stderr:
+                            error_lines = compile_result.stderr.split('\n')[:5]
+                            for line in error_lines:
+                                if line.strip():
+                                    print(f"    {line}")
+                            if len(compile_result.stderr.split('\n')) > 5:
+                                print(f"    ... (more errors)")
 
-                    print(f"  ✗ Compilation failed")
-                    if compile_result.stderr:
-                        error_lines = compile_result.stderr.split('\n')[:5]
-                        for line in error_lines:
-                            if line.strip():
-                                print(f"    {line}")
-                        if len(compile_result.stderr.split('\n')) > 5:
-                            print(f"    ... (more errors)")
+                        compile_log_path = os.path.join(log_dir, f"{test_name}_compile_attempt{compile_round}_{timestamp}.log")
+                        with open(compile_log_path, 'w', encoding='utf-8') as log_file:
+                            log_file.write("Compile command:\n")
+                            log_file.write(" ".join(compile_cmd) + "\n\n")
+                            log_file.write("STDOUT:\n")
+                            log_file.write(compile_result.stdout or "")
+                            log_file.write("\nSTDERR:\n")
+                            log_file.write(compile_result.stderr or "")
+                        print(f"  ↳ Compile log saved: {compile_log_path}")
 
-                    # 记录每轮编译失败日志
-                    compile_log_path = os.path.join(log_dir, f"{test_name}_compile_attempt{compile_round}_{timestamp}.log")
-                    with open(compile_log_path, 'w', encoding='utf-8') as log_file:
-                        log_file.write("Compile command:\n")
-                        log_file.write(" ".join(compile_cmd) + "\n\n")
-                        log_file.write("STDOUT:\n")
-                        log_file.write(compile_result.stdout or "")
-                        log_file.write("\nSTDERR:\n")
-                        log_file.write(compile_result.stderr or "")
-                    print(f"  ↳ Compile log saved: {compile_log_path}")
+                        unresolved_symbols = self._extract_unresolved_symbols(
+                            (compile_result.stderr or "") + "\n" + (compile_result.stdout or "")
+                        )
+                        if unresolved_symbols:
+                            injected_symbols = self._inject_linker_stubs(test_path, unresolved_symbols)
+                            if injected_symbols:
+                                print(
+                                    f"  [Fix] Injected {len(injected_symbols)} linker stub(s): "
+                                    + ", ".join(injected_symbols[:6])
+                                    + (" ..." if len(injected_symbols) > 6 else "")
+                                )
+                                if compile_round >= max_compile_rounds - 1:
+                                    max_compile_rounds += 1
+                                compile_round += 1
+                                continue
 
-                    unresolved_symbols = self._extract_unresolved_symbols(
-                        (compile_result.stderr or "") + "\n" + (compile_result.stdout or "")
-                    )
-                    if unresolved_symbols:
-                        injected_symbols = self._inject_linker_stubs(test_path, unresolved_symbols)
-                        if injected_symbols:
-                            print(
-                                f"  [Fix] Injected {len(injected_symbols)} linker stub(s): "
-                                + ", ".join(injected_symbols[:6])
-                                + (" ..." if len(injected_symbols) > 6 else "")
-                            )
-                            if compile_round >= max_compile_rounds - 1:
-                                max_compile_rounds += 1
-                            compile_round += 1
-                            continue
+                        if self._is_toolchain_link_error(compile_result.stderr or ""):
+                            print("  ⚠ Linker/toolchain error detected (e.g. missing gtest library).")
+                            print("    Skipping LLM code-fix because this is not a test code issue.")
+                            break
 
-                    # 工具链/依赖错误：无需进入LLM修复阶段
-                    if self._is_toolchain_link_error(compile_result.stderr or ""):
-                        print("  ⚠ Linker/toolchain error detected (e.g. missing gtest library).")
-                        print("    Skipping LLM code-fix because this is not a test code issue.")
-                        break
+                        if (not auto_fix_compile_errors) or llm_fix_count >= max_fix_attempts:
+                            break
 
-                    # 到达重试上限或未启用自动修复
-                    if (not auto_fix_compile_errors) or llm_fix_count >= max_fix_attempts:
-                        break
+                        triage_result = {
+                            "error_type": "unknown",
+                            "root_cause": "triage_skipped",
+                            "should_fix": True,
+                            "confidence": 1.0,
+                            "fix_strategy": ["direct_fix"],
+                            "key_symbols": [],
+                            "minimal_change": "apply minimal compile fix"
+                        }
 
-                    triage_result = {
-                        "error_type": "unknown",
-                        "root_cause": "triage_skipped",
-                        "should_fix": True,
-                        "confidence": 1.0,
-                        "fix_strategy": ["direct_fix"],
-                        "key_symbols": [],
-                        "minimal_change": "apply minimal compile fix"
-                    }
+                        if llm_triage_enabled:
+                            try:
+                                with open(test_path, 'r', encoding='utf-8') as f:
+                                    current_test_code = f.read()
 
-                    if llm_triage_enabled:
+                                triage_result = self.test_generator.analyze_compile_error(
+                                    current_test_code=current_test_code,
+                                    compile_error=(compile_result.stderr or compile_result.stdout or ""),
+                                    function_name=test_name.replace("_llm_test", "")
+                                )
+
+                                triage_conf = float(triage_result.get("confidence", 0.0) or 0.0)
+                                triage_type = str(triage_result.get("error_type", "unknown"))
+                                triage_cause = str(triage_result.get("root_cause", ""))
+                                print(
+                                    f"  [Triage] type={triage_type}, confidence={triage_conf:.2f}, cause={triage_cause}"
+                                )
+
+                                triage_log_path = os.path.join(
+                                    log_dir,
+                                    f"{test_name}_triage_attempt{llm_fix_count + 1}_{timestamp}.log"
+                                )
+                                with open(triage_log_path, 'w', encoding='utf-8') as triage_log:
+                                    triage_log.write("LLM triage result:\n")
+                                    triage_log.write(json.dumps(triage_result, ensure_ascii=False, indent=2))
+                                print(f"  ↳ Triage log saved: {triage_log_path}")
+
+                                if (not bool(triage_result.get("should_fix", True))) or triage_conf < triage_min_confidence:
+                                    print(
+                                        f"  ⚠ Triage decided to skip fix "
+                                        f"(should_fix={bool(triage_result.get('should_fix', True))}, "
+                                        f"confidence={triage_conf:.2f} < {triage_min_confidence:.2f})"
+                                    )
+                                    break
+                            except Exception as triage_error:
+                                print(f"  ⚠ Triage failed, fallback to direct fix: {triage_error}")
+
+                        print(f"  [Fix] Entering auto-fix phase ({llm_fix_count + 1}/{max_fix_attempts})...")
                         try:
                             with open(test_path, 'r', encoding='utf-8') as f:
                                 current_test_code = f.read()
 
-                            triage_result = self.test_generator.analyze_compile_error(
+                            fixed_test_code = self.test_generator.fix_test_from_compile_error(
                                 current_test_code=current_test_code,
                                 compile_error=(compile_result.stderr or compile_result.stdout or ""),
-                                function_name=test_name.replace("_llm_test", "")
+                                function_name=test_name.replace("_llm_test", ""),
+                                compile_analysis=triage_result if llm_triage_enabled else None
                             )
 
-                            triage_conf = float(triage_result.get("confidence", 0.0) or 0.0)
-                            triage_type = str(triage_result.get("error_type", "unknown"))
-                            triage_cause = str(triage_result.get("root_cause", ""))
-                            print(
-                                f"  [Triage] type={triage_type}, confidence={triage_conf:.2f}, cause={triage_cause}"
-                            )
+                            with open(test_path, 'w', encoding='utf-8') as f:
+                                f.write(fixed_test_code)
 
-                            triage_log_path = os.path.join(
-                                log_dir,
-                                f"{test_name}_triage_attempt{llm_fix_count + 1}_{timestamp}.log"
-                            )
-                            with open(triage_log_path, 'w', encoding='utf-8') as triage_log:
-                                triage_log.write("LLM triage result:\n")
-                                triage_log.write(json.dumps(triage_result, ensure_ascii=False, indent=2))
-                            print(f"  ↳ Triage log saved: {triage_log_path}")
+                            fix_log_path = os.path.join(log_dir, f"{test_name}_autofix_attempt{llm_fix_count + 1}_{timestamp}.log")
+                            with open(fix_log_path, 'w', encoding='utf-8') as log_file:
+                                log_file.write("Auto-fix triggered by compile error.\n\n")
+                                log_file.write("Original compile stderr (truncated to 8000 chars):\n")
+                                log_file.write((compile_result.stderr or "")[:8000])
+                                log_file.write("\n\nUpdated test file:\n")
+                                log_file.write(fixed_test_code)
 
-                            if (not bool(triage_result.get("should_fix", True))) or triage_conf < triage_min_confidence:
-                                print(
-                                    f"  ⚠ Triage decided to skip fix "
-                                    f"(should_fix={bool(triage_result.get('should_fix', True))}, "
-                                    f"confidence={triage_conf:.2f} < {triage_min_confidence:.2f})"
-                                )
-                                break
-                        except Exception as triage_error:
-                            print(f"  ⚠ Triage failed, fallback to direct fix: {triage_error}")
+                            print(f"  ↳ Auto-fix applied and saved: {test_path}")
+                            print(f"  ↳ Auto-fix log saved: {fix_log_path}")
+                            llm_fix_count += 1
+                            compile_round += 1
+                        except Exception as fix_error:
+                            print(f"  ✗ Auto-fix failed: {fix_error}")
+                            break
 
-                    # 进入查错修复阶段
-                    print(f"  [Fix] Entering auto-fix phase ({llm_fix_count + 1}/{max_fix_attempts})...")
-                    try:
-                        with open(test_path, 'r', encoding='utf-8') as f:
-                            current_test_code = f.read()
+                    if not compile_success:
+                        all_passed = False
+                        results.append((test_name, "COMPILE_FAILED"))
+                        test_finished = True
+                        continue
 
-                        fixed_test_code = self.test_generator.fix_test_from_compile_error(
-                            current_test_code=current_test_code,
-                            compile_error=(compile_result.stderr or compile_result.stdout or ""),
-                            function_name=test_name.replace("_llm_test", ""),
-                            compile_analysis=triage_result if llm_triage_enabled else None
-                        )
+                    print(f"  ✓ Compiled successfully")
+                    print(f"Running: {test_name}...")
+                    run_result = subprocess.run(
+                        [exe_path],
+                        capture_output=True,
+                        timeout=60,
+                        text=True,
+                        cwd=self.project_dir
+                    )
 
-                        with open(test_path, 'w', encoding='utf-8') as f:
-                            f.write(fixed_test_code)
+                    if run_result.returncode == 0:
+                        print(f"  ✓ All tests passed")
+                        results.append((test_name, "PASSED"))
 
-                        fix_log_path = os.path.join(log_dir, f"{test_name}_autofix_attempt{llm_fix_count + 1}_{timestamp}.log")
-                        with open(fix_log_path, 'w', encoding='utf-8') as log_file:
-                            log_file.write("Auto-fix triggered by compile error.\n\n")
-                            log_file.write("Original compile stderr (truncated to 8000 chars):\n")
-                            log_file.write((compile_result.stderr or "")[:8000])
-                            log_file.write("\n\nUpdated test file:\n")
-                            log_file.write(fixed_test_code)
+                        output_lines = run_result.stderr.split('\n')
+                        for line in output_lines:
+                            if 'passed' in line.lower() or 'ok' in line.lower():
+                                print(f"    {line.strip()}")
+                        test_finished = True
+                        continue
 
-                        print(f"  ↳ Auto-fix applied and saved: {test_path}")
-                        print(f"  ↳ Auto-fix log saved: {fix_log_path}")
-                        llm_fix_count += 1
-                        compile_round += 1
-                    except Exception as fix_error:
-                        print(f"  ✗ Auto-fix failed: {fix_error}")
-                        break
-
-                if not compile_success:
-                    all_passed = False
-                    results.append((test_name, "COMPILE_FAILED"))
-                    continue
-                
-                print(f"  ✓ Compiled successfully")
-                
-                # 运行测试
-                print(f"Running: {test_name}...")
-                run_result = subprocess.run(
-                    [exe_path],
-                    capture_output=True,
-                    timeout=60,
-                    text=True,
-                    cwd=self.project_dir
-                )
-                
-                # 解析GTest输出
-                if run_result.returncode == 0:
-                    print(f"  ✓ All tests passed")
-                    results.append((test_name, "PASSED"))
-                    
-                    # 显示简要的测试统计
-                    output_lines = run_result.stderr.split('\n')
-                    for line in output_lines:
-                        if 'passed' in line.lower() or 'ok' in line.lower():
-                            print(f"    {line.strip()}")
-                else:
                     print(f"  ✗ Some tests failed")
-                    results.append((test_name, "FAILED"))
-                    all_passed = False
-                    
-                    # 显示失败信息
                     if run_result.stderr:
                         error_lines = run_result.stderr.split('\n')
                         for line in error_lines:
                             if 'FAILED' in line or 'ERROR' in line or 'failed' in line:
                                 print(f"    {line.strip()}")
-                    log_path = os.path.join(log_dir, f"{test_name}_run_{timestamp}.log")
-                    with open(log_path, 'w', encoding='utf-8') as log_file:
+
+                    run_log_path = os.path.join(
+                        log_dir,
+                        f"{test_name}_run_attempt{runtime_fix_count}_{timestamp}.log"
+                    )
+                    with open(run_log_path, 'w', encoding='utf-8') as log_file:
                         log_file.write("Command:\n")
                         log_file.write(exe_path + "\n\n")
                         log_file.write("STDOUT:\n")
                         log_file.write(run_result.stdout or "")
                         log_file.write("\nSTDERR:\n")
                         log_file.write(run_result.stderr or "")
-                    print(f"  ↳ Run log saved: {log_path}")
+                    print(f"  ↳ Run log saved: {run_log_path}")
+
+                    if (not auto_fix_test_failures) or runtime_fix_count >= max_test_fix_attempts:
+                        results.append((test_name, "FAILED"))
+                        all_passed = False
+                        test_finished = True
+                        continue
+
+                    runtime_triage_result = {
+                        "error_type": "unknown",
+                        "root_cause": "triage_skipped",
+                        "should_fix": True,
+                        "confidence": 1.0,
+                        "fix_strategy": ["direct_fix"],
+                        "key_symbols": [],
+                        "minimal_change": "apply minimal runtime fix"
+                    }
+
+                    run_output = (run_result.stdout or "") + "\n" + (run_result.stderr or "")
+                    if llm_triage_enabled:
+                        try:
+                            with open(test_path, 'r', encoding='utf-8') as f:
+                                current_test_code = f.read()
+
+                            runtime_triage_result = self.test_generator.analyze_test_failure(
+                                current_test_code=current_test_code,
+                                test_output=run_output,
+                                function_name=test_name.replace("_llm_test", "")
+                            )
+
+                            triage_conf = float(runtime_triage_result.get("confidence", 0.0) or 0.0)
+                            triage_type = str(runtime_triage_result.get("error_type", "unknown"))
+                            triage_cause = str(runtime_triage_result.get("root_cause", ""))
+                            print(
+                                f"  [Run-Triage] type={triage_type}, confidence={triage_conf:.2f}, cause={triage_cause}"
+                            )
+
+                            triage_log_path = os.path.join(
+                                log_dir,
+                                f"{test_name}_run_triage_attempt{runtime_fix_count + 1}_{timestamp}.log"
+                            )
+                            with open(triage_log_path, 'w', encoding='utf-8') as triage_log:
+                                triage_log.write("LLM runtime triage result:\n")
+                                triage_log.write(json.dumps(runtime_triage_result, ensure_ascii=False, indent=2))
+                            print(f"  ↳ Run triage log saved: {triage_log_path}")
+
+                            if (not bool(runtime_triage_result.get("should_fix", True))) or triage_conf < triage_min_confidence:
+                                print(
+                                    f"  ⚠ Runtime triage decided to skip fix "
+                                    f"(should_fix={bool(runtime_triage_result.get('should_fix', True))}, "
+                                    f"confidence={triage_conf:.2f} < {triage_min_confidence:.2f})"
+                                )
+                                results.append((test_name, "FAILED"))
+                                all_passed = False
+                                test_finished = True
+                                continue
+                        except Exception as triage_error:
+                            print(f"  ⚠ Runtime triage failed, fallback to direct fix: {triage_error}")
+
+                    print(
+                        f"  [Fix] Entering runtime auto-fix phase ({runtime_fix_count + 1}/{max_test_fix_attempts})..."
+                    )
+                    try:
+                        with open(test_path, 'r', encoding='utf-8') as f:
+                            current_test_code = f.read()
+
+                        fixed_test_code = self.test_generator.fix_test_from_test_failure(
+                            current_test_code=current_test_code,
+                            test_output=run_output,
+                            function_name=test_name.replace("_llm_test", ""),
+                            failure_analysis=runtime_triage_result if llm_triage_enabled else None
+                        )
+
+                        with open(test_path, 'w', encoding='utf-8') as f:
+                            f.write(fixed_test_code)
+
+                        fix_log_path = os.path.join(
+                            log_dir,
+                            f"{test_name}_run_autofix_attempt{runtime_fix_count + 1}_{timestamp}.log"
+                        )
+                        with open(fix_log_path, 'w', encoding='utf-8') as log_file:
+                            log_file.write("Auto-fix triggered by test runtime failure.\n\n")
+                            log_file.write("Original run output (truncated to 8000 chars):\n")
+                            log_file.write(run_output[:8000])
+                            log_file.write("\n\nUpdated test file:\n")
+                            log_file.write(fixed_test_code)
+
+                        print(f"  ↳ Runtime auto-fix applied and saved: {test_path}")
+                        print(f"  ↳ Runtime auto-fix log saved: {fix_log_path}")
+                        runtime_fix_count += 1
+                        if compile_round >= max_compile_rounds - 1:
+                            max_compile_rounds += 1
+                        continue
+                    except Exception as run_fix_error:
+                        print(f"  ✗ Runtime auto-fix failed: {run_fix_error}")
+                        results.append((test_name, "FAILED"))
+                        all_passed = False
+                        test_finished = True
+                        continue
             
             except subprocess.TimeoutExpired:
                 print(f"  ✗ Test execution timeout")
@@ -1239,6 +1339,8 @@ Usage:
                           skip_run: bool = False,
                           auto_fix_compile_errors: bool = True,
                           max_fix_attempts: int = 2,
+                          auto_fix_test_failures: bool = True,
+                          max_test_fix_attempts: int = 2,
                           llm_triage_enabled: bool = True,
                           triage_min_confidence: float = 0.55,
                           skip_quality_gates: bool = False,
@@ -1251,6 +1353,8 @@ Usage:
             skip_run: 是否跳过测试执行步骤
             auto_fix_compile_errors: 编译失败后是否自动进入LLM修复阶段
             max_fix_attempts: 最大自动修复重试次数
+            auto_fix_test_failures: 测试运行失败后是否自动进入LLM修复阶段
+            max_test_fix_attempts: 测试运行失败最大自动修复重试次数
             llm_triage_enabled: 是否启用“先分析再修复”诊断阶段
             triage_min_confidence: 诊断最低置信度阈值
             skip_quality_gates: 是否跳过clang-format/clang-tidy/cppcheck质量闸门
@@ -1281,6 +1385,8 @@ Usage:
             self.run_tests(
                 auto_fix_compile_errors=auto_fix_compile_errors,
                 max_fix_attempts=max_fix_attempts,
+                auto_fix_test_failures=auto_fix_test_failures,
+                max_test_fix_attempts=max_test_fix_attempts,
                 llm_triage_enabled=llm_triage_enabled,
                 triage_min_confidence=triage_min_confidence
             )
@@ -1395,6 +1501,19 @@ def main():
     )
 
     parser.add_argument(
+        "--no-auto-fix-test-fail",
+        action="store_true",
+        help="Disable auto-fix phase when tests run but fail"
+    )
+
+    parser.add_argument(
+        "--max-test-fix-attempts",
+        type=int,
+        default=2,
+        help="Max retry attempts for runtime test-failure auto-fix (default: 2)"
+    )
+
+    parser.add_argument(
         "--disable-llm-triage",
         action="store_true",
         help="Disable analyze-then-fix triage stage before LLM patching"
@@ -1425,6 +1544,8 @@ def main():
     effective_quality_strict = args.quality_strict
     effective_max_fix_attempts = max(0, args.max_fix_attempts)
     effective_auto_fix_compile = not args.no_auto_fix_compile
+    effective_max_test_fix_attempts = max(0, args.max_test_fix_attempts)
+    effective_auto_fix_test_fail = not args.no_auto_fix_test_fail
     effective_llm_triage_enabled = not args.disable_llm_triage
     effective_triage_min_conf = args.triage_min_confidence if args.triage_min_confidence is not None else 0.55
     
@@ -1453,8 +1574,15 @@ def main():
                     effective_max_fix_attempts = max(0, int(compile_fix_cfg.get('max_fix_attempts', 2)))
                 except (TypeError, ValueError):
                     effective_max_fix_attempts = 2
+            if args.max_test_fix_attempts == 2:
+                try:
+                    effective_max_test_fix_attempts = max(0, int(compile_fix_cfg.get('max_test_fix_attempts', 2)))
+                except (TypeError, ValueError):
+                    effective_max_test_fix_attempts = 2
             if not args.no_auto_fix_compile and compile_fix_cfg.get('auto_fix_compile_errors') is False:
                 effective_auto_fix_compile = False
+            if not args.no_auto_fix_test_fail and compile_fix_cfg.get('auto_fix_test_failures') is False:
+                effective_auto_fix_test_fail = False
             if not args.disable_llm_triage and compile_fix_cfg.get('llm_triage_enabled') is False:
                 effective_llm_triage_enabled = False
             if args.triage_min_confidence is None:
@@ -1495,6 +1623,8 @@ def main():
             skip_run=args.skip_run,
             auto_fix_compile_errors=effective_auto_fix_compile,
             max_fix_attempts=effective_max_fix_attempts,
+            auto_fix_test_failures=effective_auto_fix_test_fail,
+            max_test_fix_attempts=effective_max_test_fix_attempts,
             llm_triage_enabled=effective_llm_triage_enabled,
             triage_min_confidence=max(0.0, min(1.0, effective_triage_min_conf)),
             skip_quality_gates=effective_skip_quality_gates,

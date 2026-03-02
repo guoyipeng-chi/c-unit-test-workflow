@@ -302,7 +302,9 @@ Then verify with:
     def run_workflow(self, functions: Optional[list] = None,
                      analyze_only: bool = False,
                      max_fix_attempts: Optional[int] = None,
+                     max_test_fix_attempts: Optional[int] = None,
                      auto_fix_compile_errors: Optional[bool] = None,
+                     auto_fix_test_failures: Optional[bool] = None,
                      llm_triage_enabled: Optional[bool] = None,
                      triage_min_confidence: Optional[float] = None) -> bool:
         """运行工作流"""
@@ -353,6 +355,23 @@ Then verify with:
         if not effective_auto_fix:
             cmd.append("--no-auto-fix-compile")
         cmd.extend(["--max-fix-attempts", str(effective_max_fix_attempts)])
+
+        effective_auto_fix_test = compile_fix_cfg.get("auto_fix_test_failures", True)
+        if auto_fix_test_failures is not None:
+            effective_auto_fix_test = auto_fix_test_failures
+
+        effective_max_test_fix_attempts = compile_fix_cfg.get("max_test_fix_attempts", 2)
+        try:
+            effective_max_test_fix_attempts = int(effective_max_test_fix_attempts)
+        except (TypeError, ValueError):
+            effective_max_test_fix_attempts = 2
+        if max_test_fix_attempts is not None:
+            effective_max_test_fix_attempts = max_test_fix_attempts
+        effective_max_test_fix_attempts = max(0, effective_max_test_fix_attempts)
+
+        if not effective_auto_fix_test:
+            cmd.append("--no-auto-fix-test-fail")
+        cmd.extend(["--max-test-fix-attempts", str(effective_max_test_fix_attempts)])
 
         effective_llm_triage_enabled = compile_fix_cfg.get("llm_triage_enabled", True)
         if llm_triage_enabled is not None:
@@ -429,7 +448,9 @@ Enter your choice (1-7):
     
     def interactive_mode(self,
                          max_fix_attempts: Optional[int] = None,
+                         max_test_fix_attempts: Optional[int] = None,
                          auto_fix_compile_errors: Optional[bool] = None,
+                         auto_fix_test_failures: Optional[bool] = None,
                          llm_triage_enabled: Optional[bool] = None,
                          triage_min_confidence: Optional[float] = None) -> None:
         """交互模式"""
@@ -451,7 +472,9 @@ Enter your choice (1-7):
                 self.run_workflow(
                     analyze_only=True,
                     max_fix_attempts=max_fix_attempts,
+                    max_test_fix_attempts=max_test_fix_attempts,
                     auto_fix_compile_errors=auto_fix_compile_errors,
+                    auto_fix_test_failures=auto_fix_test_failures,
                     llm_triage_enabled=llm_triage_enabled,
                     triage_min_confidence=triage_min_confidence
                 )
@@ -464,7 +487,9 @@ Enter your choice (1-7):
                 self.run_workflow(
                     functions=func_list,
                     max_fix_attempts=max_fix_attempts,
+                    max_test_fix_attempts=max_test_fix_attempts,
                     auto_fix_compile_errors=auto_fix_compile_errors,
+                    auto_fix_test_failures=auto_fix_test_failures,
                     llm_triage_enabled=llm_triage_enabled,
                     triage_min_confidence=triage_min_confidence
                 )
@@ -478,7 +503,9 @@ Enter your choice (1-7):
                         continue
                 self.run_workflow(
                     max_fix_attempts=max_fix_attempts,
+                    max_test_fix_attempts=max_test_fix_attempts,
                     auto_fix_compile_errors=auto_fix_compile_errors,
+                    auto_fix_test_failures=auto_fix_test_failures,
                     llm_triage_enabled=llm_triage_enabled,
                     triage_min_confidence=triage_min_confidence
                 )
@@ -552,6 +579,19 @@ def main():
     )
 
     parser.add_argument(
+        "--max-test-fix-attempts",
+        type=int,
+        default=None,
+        help="Override runtime test-failure auto-fix max retry attempts for quickstart"
+    )
+
+    parser.add_argument(
+        "--no-auto-fix-test-fail",
+        action="store_true",
+        help="Disable runtime test-failure auto-fix phase in quickstart"
+    )
+
+    parser.add_argument(
         "--disable-llm-triage",
         action="store_true",
         help="Disable analyze-then-fix triage before LLM patch"
@@ -580,7 +620,9 @@ def main():
     if args.interactive or not action_requested:
         quickstart.interactive_mode(
             max_fix_attempts=args.max_fix_attempts,
+            max_test_fix_attempts=args.max_test_fix_attempts,
             auto_fix_compile_errors=(False if args.no_auto_fix_compile else None),
+            auto_fix_test_failures=(False if args.no_auto_fix_test_fail else None),
             llm_triage_enabled=(False if args.disable_llm_triage else None),
             triage_min_confidence=args.triage_min_confidence
         )
@@ -609,7 +651,9 @@ def main():
         if quickstart.run_workflow(
             analyze_only=True,
             max_fix_attempts=args.max_fix_attempts,
+            max_test_fix_attempts=args.max_test_fix_attempts,
             auto_fix_compile_errors=(False if args.no_auto_fix_compile else None),
+            auto_fix_test_failures=(False if args.no_auto_fix_test_fail else None),
             llm_triage_enabled=(False if args.disable_llm_triage else None),
             triage_min_confidence=args.triage_min_confidence
         ):
@@ -624,7 +668,9 @@ def main():
         if quickstart.run_workflow(
             functions=functions,
             max_fix_attempts=args.max_fix_attempts,
+            max_test_fix_attempts=args.max_test_fix_attempts,
             auto_fix_compile_errors=(False if args.no_auto_fix_compile else None),
+            auto_fix_test_failures=(False if args.no_auto_fix_test_fail else None),
             llm_triage_enabled=(False if args.disable_llm_triage else None),
             triage_min_confidence=args.triage_min_confidence
         ):
