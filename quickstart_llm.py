@@ -10,8 +10,9 @@ import json
 import argparse
 import subprocess
 import shutil
+import re
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Tuple
 
 
 class QuickStart:
@@ -240,6 +241,187 @@ class QuickStart:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+
+    def _discover_functions_for_selection(self) -> List[Tuple[str, str]]:
+        include_dir = self.project_root / self.config.get("paths", {}).get("include_dir", "include")
+        src_dir = self.project_root / self.config.get("paths", {}).get("src_dir", "src")
+
+        if not include_dir.exists() or not src_dir.exists():
+            return []
+
+        sys.path.insert(0, str(self.tools_dir))
+        from c_code_analyzer import CCodeAnalyzer
+
+        analyzer = CCodeAnalyzer(str(include_dir), str(src_dir))
+        analyzer.analyze_directory()
+        funcs = analyzer.get_all_functions()
+
+        records: List[Tuple[str, str]] = []
+        for name, dep in funcs.items():
+            source = str(dep.source_file).replace('\\', '/')
+            records.append((name, source))
+
+        records.sort(key=lambda item: item[0].lower())
+        return records
+
+    @staticmethod
+    def _with_function_tab_completion(function_names: List[str]):
+        try:
+            import readline
+
+            original_completer = readline.get_completer()
+            original_delims = readline.get_completer_delims()
+
+            choices = sorted(set(function_names), key=str.lower)
+
+            def completer(text, state):
+                buffer = readline.get_line_buffer()
+                begidx = readline.get_begidx()
+                token = buffer[:begidx].split()[-1] if buffer[:begidx].split() else ""
+                prefix = text or token
+                matches = [name for name in choices if name.lower().startswith(prefix.lower())]
+                if state < len(matches):
+                    return matches[state]
+                return None
+
+            readline.set_completer_delims(" \t\n;")
+            readline.parse_and_bind("tab: complete")
+            readline.set_completer(completer)
+
+            def restore():
+                readline.set_completer(original_completer)
+                readline.set_completer_delims(original_delims)
+
+            return restore
+        except Exception:
+            return lambda: None
+
+    @staticmethod
+    def _parse_index_tokens(raw: str, max_index: int) -> List[int]:
+        selected: List[int] = []
+        tokens = [t for t in re.split(r"[\s,]+", raw.strip()) if t]
+        for token in tokens:
+            if "-" in token:
+                left, right = token.split("-", 1)
+                if left.isdigit() and right.isdigit():
+                    start = int(left)
+                    end = int(right)
+                    if start > end:
+                        start, end = end, start
+                    for index in range(start, end + 1):
+                        if 1 <= index <= max_index:
+                            selected.append(index)
+                continue
+            if token.isdigit():
+                index = int(token)
+                if 1 <= index <= max_index:
+                    selected.append(index)
+        return sorted(set(selected))
+
+    def select_functions_interactively(self) -> Tuple[Optional[List[str]], bool]:
+        records = self._discover_functions_for_selection()
+        if not records:
+            print("✗ No functions discovered under current include/src paths.")
+            return None, True
+
+        page_size = 12
+        total = len(records)
+        current_page = 0
+        selected_indices = set()
+        function_names = [name for name, _ in records]
+        restore_completion = self._with_function_tab_completion(function_names)
+
+        try:
+            while True:
+                total_pages = max(1, (total + page_size - 1) // page_size)
+                current_page = max(0, min(current_page, total_pages - 1))
+                start = current_page * page_size
+                end = min(total, start + page_size)
+
+                print("\n[Function Picker]")
+                print(f"Page {current_page + 1}/{total_pages}, total functions: {total}")
+                print("Commands: n(next), p(prev), a(all), d(done), c(clear), q(cancel)")
+                print("Input: number(s) like 1 3 8-12, or function name/prefix (Tab to complete)")
+                print("-" * 72)
+
+                for idx in range(start, end):
+                    name, src = records[idx]
+                    marker = "*" if (idx + 1) in selected_indices else " "
+                    print(f"{marker} {idx + 1:>3}. {name:<32} {src}")
+
+                if selected_indices:
+                    preview = [records[i - 1][0] for i in sorted(selected_indices)[:8]]
+                    tail = " ..." if len(selected_indices) > 8 else ""
+                    print(f"Selected({len(selected_indices)}): {', '.join(preview)}{tail}")
+
+                raw = input("select> ").strip()
+                if not raw:
+                    continue
+
+                cmd = raw.lower()
+                if cmd in {"n", "next"}:
+                    current_page = min(current_page + 1, total_pages - 1)
+                    continue
+                if cmd in {"p", "prev"}:
+                    current_page = max(current_page - 1, 0)
+                    continue
+                if cmd in {"a", "all"}:
+                    print("✓ Select all functions")
+                    return None, False
+                if cmd in {"c", "clear"}:
+                    selected_indices.clear()
+                    continue
+                if cmd in {"q", "quit", "cancel"}:
+                    return None, True
+                if cmd in {"d", "done", "ok"}:
+                    if not selected_indices:
+                        print("⚠ No selected function, use a/all or choose indices first.")
+                        continue
+                    selected = [records[i - 1][0] for i in sorted(selected_indices)]
+                    return selected, False
+
+                index_hits = self._parse_index_tokens(raw, total)
+                if index_hits:
+                    for idx in index_hits:
+                        if idx in selected_indices:
+                            selected_indices.remove(idx)
+                        else:
+                            selected_indices.add(idx)
+                    continue
+
+                name_tokens = [t for t in re.split(r"[\s,]+", raw) if t]
+                matched_any = False
+                for token in name_tokens:
+                    exact = [i + 1 for i, (name, _) in enumerate(records) if name == token]
+                    if exact:
+                        idx = exact[0]
+                        if idx in selected_indices:
+                            selected_indices.remove(idx)
+                        else:
+                            selected_indices.add(idx)
+                        matched_any = True
+                        continue
+
+                    pref = [i + 1 for i, (name, _) in enumerate(records) if name.lower().startswith(token.lower())]
+                    if len(pref) == 1:
+                        idx = pref[0]
+                        if idx in selected_indices:
+                            selected_indices.remove(idx)
+                        else:
+                            selected_indices.add(idx)
+                        matched_any = True
+                        continue
+
+                    if len(pref) > 1:
+                        examples = ", ".join(records[i - 1][0] for i in pref[:8])
+                        print(f"⚠ Prefix '{token}' matches multiple functions: {examples}")
+                        matched_any = True
+                        continue
+
+                if not matched_any:
+                    print("⚠ Unrecognized input. Use n/p/a/d/c/q, indices, or function name prefix.")
+        finally:
+            restore_completion()
     
     def setup_vllm(self) -> None:
         """帮助设置vLLM"""
@@ -549,8 +731,10 @@ Enter your choice (1-7):
                 if not self.check_environment(prompt_install_compiler=True):
                     print("✗ Environment check failed!")
                     continue
-                functions = input("Enter function names (space-separated, or leave blank for all): ")
-                func_list = functions.split() if functions.strip() else None
+                func_list, cancelled = self.select_functions_interactively()
+                if cancelled:
+                    print("Selection cancelled.")
+                    continue
                 self.run_workflow(
                     functions=func_list,
                     max_fix_attempts=max_fix_attempts,
@@ -784,6 +968,15 @@ def main():
         if not quickstart.check_environment():
             sys.exit(1)
         functions = args.generate if args.generate else None
+        if args.generate == []:
+            if sys.stdin.isatty():
+                functions, cancelled = quickstart.select_functions_interactively()
+                if cancelled:
+                    print("✗ Function selection cancelled")
+                    sys.exit(1)
+            else:
+                print("⚠ --generate without names in non-interactive mode defaults to all functions")
+                functions = None
         if quickstart.run_workflow(
             functions=functions,
             max_fix_attempts=args.max_fix_attempts,
