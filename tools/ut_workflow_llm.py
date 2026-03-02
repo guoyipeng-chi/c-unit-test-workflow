@@ -405,7 +405,7 @@ class LLMUTWorkflow:
                             include_dirs.append(include_flag)
             
             # 准备编译命令
-            compile_cmd = ["g++", "-std=c99", "-o", exe_path]
+            compile_cmd = ["g++", "-std=c++14", "-o", exe_path]
             compile_cmd.extend(include_dirs)
             compile_cmd.append("-I/usr/include/gtest")
             compile_cmd.extend(source_files)
