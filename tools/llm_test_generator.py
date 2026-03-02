@@ -201,6 +201,62 @@ Return ONLY the C++ code, no markdown wrappers."""
         response = response.strip()
         
         return response
+
+    def fix_test_from_compile_error(self,
+                                    current_test_code: str,
+                                    compile_error: str,
+                                    function_name: str = "unknown") -> str:
+        """
+        根据编译错误修复测试代码
+
+        Args:
+            current_test_code: 当前测试代码
+            compile_error: 编译器错误输出
+            function_name: 目标函数名（用于日志）
+
+        Returns:
+            修复后的测试代码；若修复失败则返回原代码
+        """
+        prompt = f"""You are an expert C/C++ unit test engineer.
+Fix the following Google Test file based on compiler errors.
+
+Requirements:
+1. Keep the same test intent and function target.
+2. Fix include errors, type/signature mismatches, mock declarations, and syntax errors.
+3. Keep using Google Test / Google Mock.
+4. Return ONLY the complete updated C++ test file.
+
+Target Function: {function_name}
+
+=== CURRENT TEST CODE ===
+```cpp
+{current_test_code}
+```
+
+=== COMPILER ERRORS ===
+```
+{compile_error}
+```
+"""
+
+        logger.info(f"Fixing test code from compile error for {function_name}...")
+        response = self.llm.generate(
+            prompt,
+            temperature=0.2,
+            max_tokens=8192,
+            top_p=0.9
+        )
+
+        if not response:
+            logger.warning(f"Failed to fix test for {function_name}, keep original code")
+            return current_test_code
+
+        fixed_code = self._clean_response(response)
+        if not fixed_code.strip():
+            logger.warning(f"Empty fixed code for {function_name}, keep original code")
+            return current_test_code
+
+        return fixed_code
     
     def _generate_fallback_test(self, func_dep: FunctionDependency) -> str:
         """生成备选测试代码"""

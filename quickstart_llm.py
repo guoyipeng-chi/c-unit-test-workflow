@@ -25,8 +25,19 @@ class QuickStart:
     def _load_config(self) -> dict:
         """加载配置文件"""
         if self.config_file.exists():
-            with open(self.config_file, 'r') as f:
-                return json.load(f)
+            last_decode_error = None
+            for encoding in ("utf-8", "utf-8-sig", "gbk"):
+                try:
+                    with open(self.config_file, 'r', encoding=encoding) as f:
+                        return json.load(f)
+                except UnicodeDecodeError as e:
+                    last_decode_error = e
+                    continue
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"Invalid JSON in config file: {self.config_file}") from e
+            raise ValueError(
+                f"Failed to decode config file: {self.config_file}. Please save it as UTF-8."
+            ) from last_decode_error
         
         return {
             "llm": {

@@ -305,13 +305,18 @@ class LLMUTWorkflow:
         
         return all_valid
     
-    def run_tests(self, test_dir: Optional[str] = None, build_dir: str = "build-test") -> bool:
+    def run_tests(self, test_dir: Optional[str] = None,
+                  build_dir: str = "build-test",
+                  auto_fix_compile_errors: bool = True,
+                  max_fix_attempts: int = 2) -> bool:
         """
         编译并执行生成的测试用例
         
         Args:
             test_dir: 测试文件所在目录
             build_dir: 测试编译目录
+            auto_fix_compile_errors: 编译失败后是否自动进入LLM修复阶段
+            max_fix_attempts: 最大自动修复重试次数
             
         Returns:
             是否执行成功
@@ -408,35 +413,81 @@ class LLMUTWorkflow:
             compile_cmd.extend(["-lgtest", "-lgtest_main", "-lpthread"])
             
             try:
-                # 编译测试
-                print(f"Compiling: {test_name}...")
-                compile_result = subprocess.run(
-                    compile_cmd,
-                    capture_output=True,
-                    timeout=120,
-                    text=True,
-                    cwd=self.project_dir
-                )
-                
-                if compile_result.returncode != 0:
+                compile_result = None
+                compile_success = False
+
+                for attempt in range(max_fix_attempts + 1):
+                    if attempt == 0:
+                        print(f"Compiling: {test_name}...")
+                    else:
+                        print(f"Compiling after auto-fix attempt {attempt}/{max_fix_attempts}: {test_name}...")
+
+                    compile_result = subprocess.run(
+                        compile_cmd,
+                        capture_output=True,
+                        timeout=120,
+                        text=True,
+                        cwd=self.project_dir
+                    )
+
+                    if compile_result.returncode == 0:
+                        compile_success = True
+                        break
+
                     print(f"  ✗ Compilation failed")
                     if compile_result.stderr:
-                        # 只显示前几行错误信息
                         error_lines = compile_result.stderr.split('\n')[:5]
                         for line in error_lines:
                             if line.strip():
                                 print(f"    {line}")
                         if len(compile_result.stderr.split('\n')) > 5:
                             print(f"    ... (more errors)")
-                    log_path = os.path.join(log_dir, f"{test_name}_compile_{timestamp}.log")
-                    with open(log_path, 'w', encoding='utf-8') as log_file:
+
+                    # 记录每轮编译失败日志
+                    compile_log_path = os.path.join(log_dir, f"{test_name}_compile_attempt{attempt}_{timestamp}.log")
+                    with open(compile_log_path, 'w', encoding='utf-8') as log_file:
                         log_file.write("Compile command:\n")
                         log_file.write(" ".join(compile_cmd) + "\n\n")
                         log_file.write("STDOUT:\n")
                         log_file.write(compile_result.stdout or "")
                         log_file.write("\nSTDERR:\n")
                         log_file.write(compile_result.stderr or "")
-                    print(f"  ↳ Compile log saved: {log_path}")
+                    print(f"  ↳ Compile log saved: {compile_log_path}")
+
+                    # 到达重试上限或未启用自动修复
+                    if (not auto_fix_compile_errors) or attempt >= max_fix_attempts:
+                        break
+
+                    # 进入查错修复阶段
+                    print(f"  [Fix] Entering auto-fix phase ({attempt + 1}/{max_fix_attempts})...")
+                    try:
+                        with open(test_path, 'r', encoding='utf-8') as f:
+                            current_test_code = f.read()
+
+                        fixed_test_code = self.test_generator.fix_test_from_compile_error(
+                            current_test_code=current_test_code,
+                            compile_error=(compile_result.stderr or compile_result.stdout or ""),
+                            function_name=test_name.replace("_llm_test", "")
+                        )
+
+                        with open(test_path, 'w', encoding='utf-8') as f:
+                            f.write(fixed_test_code)
+
+                        fix_log_path = os.path.join(log_dir, f"{test_name}_autofix_attempt{attempt + 1}_{timestamp}.log")
+                        with open(fix_log_path, 'w', encoding='utf-8') as log_file:
+                            log_file.write("Auto-fix triggered by compile error.\n\n")
+                            log_file.write("Original compile stderr (truncated to 8000 chars):\n")
+                            log_file.write((compile_result.stderr or "")[:8000])
+                            log_file.write("\n\nUpdated test file:\n")
+                            log_file.write(fixed_test_code)
+
+                        print(f"  ↳ Auto-fix applied and saved: {test_path}")
+                        print(f"  ↳ Auto-fix log saved: {fix_log_path}")
+                    except Exception as fix_error:
+                        print(f"  ✗ Auto-fix failed: {fix_error}")
+                        break
+
+                if not compile_success:
                     all_passed = False
                     results.append((test_name, "COMPILE_FAILED"))
                     continue
@@ -541,13 +592,19 @@ Usage:
   python ut_workflow_llm.py --help
 """)
     
-    def run_full_workflow(self, target_functions: Optional[List[str]] = None, skip_run: bool = False) -> None:
+    def run_full_workflow(self,
+                          target_functions: Optional[List[str]] = None,
+                          skip_run: bool = False,
+                          auto_fix_compile_errors: bool = True,
+                          max_fix_attempts: int = 2) -> None:
         """
         运行完整工作流
         
         Args:
             target_functions: 目标函数列表
             skip_run: 是否跳过测试执行步骤
+            auto_fix_compile_errors: 编译失败后是否自动进入LLM修复阶段
+            max_fix_attempts: 最大自动修复重试次数
         """
         self.show_workflow_info()
         self.analyze_codebase()
@@ -556,7 +613,10 @@ Usage:
         self.verify_tests()
         
         if not skip_run:
-            self.run_tests()
+            self.run_tests(
+                auto_fix_compile_errors=auto_fix_compile_errors,
+                max_fix_attempts=max_fix_attempts
+            )
         
         print("\n" + "=" * 60)
         print("✓ Workflow completed!")
@@ -653,6 +713,19 @@ def main():
         action="store_true",
         help="Skip running tests (only generate, don't execute)"
     )
+
+    parser.add_argument(
+        "--no-auto-fix-compile",
+        action="store_true",
+        help="Disable auto-fix phase when test compilation fails"
+    )
+
+    parser.add_argument(
+        "--max-fix-attempts",
+        type=int,
+        default=2,
+        help="Max retry attempts for compile error auto-fix (default: 2)"
+    )
     
     args = parser.parse_args()
     
@@ -695,7 +768,9 @@ def main():
     else:
         workflow.run_full_workflow(
             target_functions=args.functions,
-            skip_run=args.skip_run
+            skip_run=args.skip_run,
+            auto_fix_compile_errors=not args.no_auto_fix_compile,
+            max_fix_attempts=max(0, args.max_fix_attempts)
         )
 
 
