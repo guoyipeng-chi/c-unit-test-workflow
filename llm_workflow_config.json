@@ -47,6 +47,11 @@
     "output_suffix": "_llm_test.cpp",
     "include_mocks": true,
     "coverage_goal": 80,
+    "quality_gates": {
+      "enabled": true,
+      "strict": false,
+      "tools": ["clang-format", "clang-tidy", "cppcheck"]
+    },
     "test_cases_per_function": {
       "minimum": 5,
       "recommended": 10
@@ -59,6 +64,13 @@
       "./build-ninja-msvc/compile_commands.json",
       "./cmake-build-debug/compile_commands.json"
     ]
+  },
+
+  "build": {
+    "compiler": "",
+    "compiler_comment": "可选：g++ / clang++ / cl 或编译器绝对路径。留空则自动检测",
+    "auto_install_on_missing": true,
+    "auto_install_comment": "仅交互模式生效；Windows下会尝试用winget安装LLVM(clang++)"
   },
 
   "paths": {

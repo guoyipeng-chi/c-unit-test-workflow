@@ -47,7 +47,74 @@ class QuickStart:
             }
         }
     
-    def check_environment(self) -> bool:
+    def _resolve_compiler(self) -> tuple[Optional[str], Optional[str]]:
+        """解析可用C++编译器（优先配置项）。返回(compiler_path, detail_msg)。"""
+        build_cfg = self.config.get("build", {})
+        configured = str(build_cfg.get("compiler", "")).strip()
+
+        if configured:
+            candidate = Path(configured)
+            if candidate.exists():
+                return str(candidate), None
+            found = shutil.which(configured)
+            if found:
+                return found, None
+            return None, f"Configured compiler not found: {configured}"
+
+        auto_found = shutil.which("g++") or shutil.which("clang++") or shutil.which("cl")
+        if auto_found:
+            return auto_found, None
+
+        # 常见Windows安装路径兜底（PATH未刷新场景）
+        common_windows_compilers = [
+            Path("C:/Program Files/LLVM/bin/clang++.exe"),
+            Path("C:/Program Files/LLVM/bin/clang-cl.exe"),
+        ]
+        for compiler_path in common_windows_compilers:
+            if compiler_path.exists():
+                return str(compiler_path), "Found in common install path"
+
+        return None, None
+
+    def _auto_install_compiler(self) -> bool:
+        """自动安装编译器（当前仅Windows支持winget安装LLVM）。"""
+        if os.name != 'nt':
+            print("[Install] Auto install is currently implemented for Windows only.")
+            return False
+
+        winget = shutil.which("winget")
+        if not winget:
+            print("[Install] winget not found. Please install Visual Studio Build Tools or LLVM manually.")
+            return False
+
+        print("[Install] Installing LLVM (clang++) via winget...")
+        cmd = [
+            winget,
+            "install",
+            "--id", "LLVM.LLVM",
+            "-e",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+            "--silent"
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print("[Install] Failed to install LLVM automatically.")
+            if result.stderr:
+                print(result.stderr[:500])
+            return False
+
+        # 尝试将常见LLVM路径加入当前进程PATH，便于立即检测
+        llvm_bin = Path("C:/Program Files/LLVM/bin")
+        if llvm_bin.exists():
+            current_path = os.environ.get("PATH", "")
+            if str(llvm_bin) not in current_path:
+                os.environ["PATH"] = str(llvm_bin) + os.pathsep + current_path
+
+        return True
+
+    def check_environment(self, prompt_install_compiler: bool = False) -> bool:
         """检查环境"""
         print("[Check] Checking environment...")
         print("=" * 60)
@@ -77,10 +144,25 @@ class QuickStart:
         has_vllm = self._check_vllm_connection(api_base)
         checks.append(("LLM service", has_vllm, api_base))
 
-        # 检查C++编译器
-        compiler = shutil.which("g++") or shutil.which("clang++") or shutil.which("cl")
+        # 检查C++编译器（支持配置）
+        compiler, compiler_detail = self._resolve_compiler()
         has_compiler = compiler is not None
-        checks.append(("C++ compiler", has_compiler, compiler or "Not found"))
+        compiler_msg = compiler or "Not found"
+        if compiler_detail:
+            compiler_msg = f"{compiler_msg} ({compiler_detail})"
+
+        # 交互模式可询问自动安装
+        if (not has_compiler) and prompt_install_compiler and self.config.get("build", {}).get("auto_install_on_missing", True):
+            answer = input("C++ compiler not found. Auto install LLVM clang++ now? (y/N): ").strip().lower()
+            if answer in ("y", "yes"):
+                if self._auto_install_compiler():
+                    compiler, compiler_detail = self._resolve_compiler()
+                    has_compiler = compiler is not None
+                    compiler_msg = compiler or "Not found after install"
+                    if compiler_detail:
+                        compiler_msg = f"{compiler_msg} ({compiler_detail})"
+
+        checks.append(("C++ compiler", has_compiler, compiler_msg))
         
         # 打印检查结果
         all_passed = True
@@ -244,6 +326,12 @@ Then verify with:
         if functions:
             cmd.extend(["--functions"] + functions)
 
+        quality_cfg = self.config.get("test_generation", {}).get("quality_gates", {})
+        if quality_cfg.get("enabled") is False:
+            cmd.append("--skip-quality-gates")
+        if quality_cfg.get("strict") is True:
+            cmd.append("--quality-strict")
+
         # 从配置透传LLM后端与Ollama设置到子进程环境
         env = os.environ.copy()
         llm_cfg = self.config.get("llm", {})
@@ -268,6 +356,16 @@ Then verify with:
             env["OLLAMA_MAX_TOKENS"] = str(ollama_cfg.get("max_tokens"))
         if ollama_cfg.get("fallback_from_vllm") is not None:
             env["VLLM_FALLBACK_TO_OLLAMA"] = str(ollama_cfg.get("fallback_from_vllm"))
+
+        # 透传编译器配置
+        build_cfg = self.config.get("build", {})
+        configured_compiler = str(build_cfg.get("compiler", "")).strip()
+        if configured_compiler:
+            env["CXX"] = configured_compiler
+        else:
+            resolved_compiler, _ = self._resolve_compiler()
+            if resolved_compiler:
+                env["CXX"] = resolved_compiler
         
         # 运行工作流
         result = subprocess.run(cmd, cwd=str(self.tools_dir), env=env)
@@ -298,25 +396,25 @@ Enter your choice (1-7):
             choice = input("> ").strip()
             
             if choice == "1":
-                self.check_environment()
+                self.check_environment(prompt_install_compiler=True)
             elif choice == "2":
                 self.setup_vllm()
             elif choice == "3":
                 self.generate_compile_commands()
             elif choice == "4":
-                if not self.check_environment():
+                if not self.check_environment(prompt_install_compiler=True):
                     print("✗ Environment check failed!")
                     continue
                 self.run_workflow(analyze_only=True)
             elif choice == "5":
-                if not self.check_environment():
+                if not self.check_environment(prompt_install_compiler=True):
                     print("✗ Environment check failed!")
                     continue
                 functions = input("Enter function names (space-separated, or leave blank for all): ")
                 func_list = functions.split() if functions.strip() else None
                 self.run_workflow(functions=func_list)
             elif choice == "6":
-                if not self.check_environment():
+                if not self.check_environment(prompt_install_compiler=True):
                     print("✗ Environment check failed!")
                     continue
                 if not self._find_compile_commands():

@@ -10,6 +10,7 @@ import argparse
 import json
 import subprocess
 import shutil
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -329,7 +330,160 @@ class LLMUTWorkflow:
         
         return all_valid
 
-    def _resolve_gtest_link_inputs(self, include_dirs: List[str], build_path: str) -> List[str]:
+    def run_quality_gates(self, test_dir: Optional[str] = None, strict: bool = False) -> bool:
+        """
+        运行生成测试代码的质量闸门工具：clang-format / clang-tidy / cppcheck
+
+        Args:
+            test_dir: 测试文件目录
+            strict: 严格模式（任一工具报错即失败）
+
+        Returns:
+            质量闸门整体是否通过
+        """
+        print("\n[Quality] Running quality gates (clang-format / clang-tidy / cppcheck)...")
+        print("=" * 60)
+
+        if test_dir is None:
+            test_dir = self.test_dir
+
+        log_dir = os.path.join(self.project_dir, "log")
+        os.makedirs(log_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        test_files = [
+            os.path.join(test_dir, f)
+            for f in os.listdir(test_dir)
+            if f.endswith('_llm_test.cpp')
+        ]
+
+        if not test_files:
+            print("⚠ No generated test files for quality gates")
+            return False if strict else True
+
+        include_dirs = ["-I" + self.include_dir]
+        if hasattr(self.compile_analyzer, 'compile_info'):
+            for _, compile_info in self.compile_analyzer.compile_info.items():
+                include_list = []
+                if hasattr(compile_info, 'include_dirs'):
+                    include_list = compile_info.include_dirs
+                elif isinstance(compile_info, dict):
+                    include_list = compile_info.get('includes') or compile_info.get('include_dirs', [])
+                for inc in include_list:
+                    include_flag = "-I" + inc
+                    if include_flag not in include_dirs:
+                        include_dirs.append(include_flag)
+
+        tools = {
+            "clang-format": self._find_tool("clang-format"),
+            "clang-tidy": self._find_tool("clang-tidy"),
+            "cppcheck": self._find_tool("cppcheck"),
+        }
+
+        passed = True
+        tool_failures = []
+
+        for tool_name, tool_path in tools.items():
+            if not tool_path:
+                print(f"- {tool_name}: not found, skipped")
+                continue
+
+            print(f"- {tool_name}: {tool_path}")
+
+            if tool_name == "clang-format":
+                for test_file in test_files:
+                    # 先自动格式化，保证生成文件最小可读性
+                    fmt_result = subprocess.run(
+                        [tool_path, "-i", test_file],
+                        capture_output=True,
+                        text=True,
+                        cwd=self.project_dir
+                    )
+                    if fmt_result.returncode != 0:
+                        passed = False
+                        tool_failures.append((tool_name, test_file))
+                        log_path = os.path.join(log_dir, f"quality_clang_format_{Path(test_file).name}_{timestamp}.log")
+                        with open(log_path, 'w', encoding='utf-8') as f:
+                            f.write(fmt_result.stdout or "")
+                            f.write("\n")
+                            f.write(fmt_result.stderr or "")
+                        print(f"  ✗ clang-format failed for {Path(test_file).name}")
+                        print(f"    ↳ log: {log_path}")
+
+            elif tool_name == "clang-tidy":
+                for test_file in test_files:
+                    tidy_cmd = [
+                        tool_path,
+                        test_file,
+                        "--",
+                        "-std=c++14",
+                    ]
+                    tidy_cmd.extend(include_dirs)
+                    tidy_result = subprocess.run(
+                        tidy_cmd,
+                        capture_output=True,
+                        text=True,
+                        cwd=self.project_dir
+                    )
+                    if tidy_result.returncode != 0:
+                        passed = False
+                        tool_failures.append((tool_name, test_file))
+                        log_path = os.path.join(log_dir, f"quality_clang_tidy_{Path(test_file).name}_{timestamp}.log")
+                        with open(log_path, 'w', encoding='utf-8') as f:
+                            f.write("Command:\n")
+                            f.write(" ".join(tidy_cmd) + "\n\n")
+                            f.write(tidy_result.stdout or "")
+                            f.write("\n")
+                            f.write(tidy_result.stderr or "")
+                        print(f"  ✗ clang-tidy reported issues for {Path(test_file).name}")
+                        print(f"    ↳ log: {log_path}")
+
+            elif tool_name == "cppcheck":
+                for test_file in test_files:
+                    cppcheck_cmd = [
+                        tool_path,
+                        "--language=c++",
+                        "--enable=warning,style,performance,portability",
+                        "--std=c++14",
+                        "--error-exitcode=1",
+                        test_file,
+                    ]
+                    cppcheck_cmd.extend(include_dirs)
+                    cppcheck_result = subprocess.run(
+                        cppcheck_cmd,
+                        capture_output=True,
+                        text=True,
+                        cwd=self.project_dir
+                    )
+                    if cppcheck_result.returncode != 0:
+                        passed = False
+                        tool_failures.append((tool_name, test_file))
+                        log_path = os.path.join(log_dir, f"quality_cppcheck_{Path(test_file).name}_{timestamp}.log")
+                        with open(log_path, 'w', encoding='utf-8') as f:
+                            f.write("Command:\n")
+                            f.write(" ".join(cppcheck_cmd) + "\n\n")
+                            f.write(cppcheck_result.stdout or "")
+                            f.write("\n")
+                            f.write(cppcheck_result.stderr or "")
+                        print(f"  ✗ cppcheck reported issues for {Path(test_file).name}")
+                        print(f"    ↳ log: {log_path}")
+
+        if passed:
+            print("✓ Quality gates passed (or no issues from available tools)")
+            return True
+
+        print("⚠ Quality gates found issues")
+        if strict:
+            print("  Strict mode enabled: stopping workflow")
+            return False
+
+        print("  Non-strict mode: continue workflow")
+        return True
+
+    def _resolve_gtest_link_inputs(self,
+                                   include_dirs: List[str],
+                                   build_path: str,
+                                   prefer_sources: bool = False) -> List[str]:
         """
         解析gtest链接输入，优先级：
         1) 本地已构建的静态库（libgtest_main/libgtest）
@@ -344,11 +498,76 @@ class LLMUTWorkflow:
             os.path.join(self.project_dir, "build-ninja-msvc"),
         ]
 
+        def _find_gtest_sources() -> Optional[List[str]]:
+            gtest_root = None
+            gmock_root = None
+            for inc_flag in include_dirs:
+                if not inc_flag.startswith("-I"):
+                    continue
+                inc_path = inc_flag[2:]
+                marker = os.path.join("googletest", "include")
+                if marker in inc_path:
+                    gtest_root = inc_path.split(marker)[0] + "googletest"
+                gmock_marker = os.path.join("googlemock", "include")
+                if gmock_marker in inc_path:
+                    gmock_root = inc_path.split(gmock_marker)[0] + "googlemock"
+                    break
+
+            if not gtest_root:
+                for root in candidate_roots:
+                    candidate = os.path.join(root, "_deps", "googletest-src", "googletest")
+                    if os.path.isdir(candidate):
+                        gtest_root = candidate
+                        break
+
+            if not gmock_root:
+                for root in candidate_roots:
+                    candidate = os.path.join(root, "_deps", "googletest-src", "googlemock")
+                    if os.path.isdir(candidate):
+                        gmock_root = candidate
+                        break
+
+            if gtest_root:
+                gtest_all = os.path.join(gtest_root, "src", "gtest-all.cc")
+                gtest_main = os.path.join(gtest_root, "src", "gtest_main.cc")
+                if os.path.exists(gtest_all) and os.path.exists(gtest_main):
+                    root_inc = f"-I{gtest_root}"
+                    include_inc = f"-I{os.path.join(gtest_root, 'include')}"
+                    if root_inc not in include_dirs:
+                        include_dirs.append(root_inc)
+                    if include_inc not in include_dirs:
+                        include_dirs.append(include_inc)
+
+                    source_inputs = [gtest_all, gtest_main]
+
+                    if gmock_root:
+                        gmock_all = os.path.join(gmock_root, "src", "gmock-all.cc")
+                        if os.path.exists(gmock_all):
+                            gmock_root_inc = f"-I{gmock_root}"
+                            gmock_include_inc = f"-I{os.path.join(gmock_root, 'include')}"
+                            if gmock_root_inc not in include_dirs:
+                                include_dirs.append(gmock_root_inc)
+                            if gmock_include_inc not in include_dirs:
+                                include_dirs.append(gmock_include_inc)
+                            source_inputs.insert(0, gmock_all)
+
+                    print(f"[Link] Using gtest/gmock sources: {', '.join(source_inputs)}")
+                    return source_inputs
+            return None
+
+        # 对非MSVC编译器，优先源码方式避免Windows CRT/ABI不匹配
+        if prefer_sources:
+            source_inputs = _find_gtest_sources()
+            if source_inputs:
+                return source_inputs
+
         # 1) 查找已构建库
         gtest_main_lib = None
         gtest_lib = None
+        gmock_lib = None
         lib_main_names = {"libgtest_main.a", "gtest_main.lib", "libgtest_main.so"}
         lib_names = {"libgtest.a", "gtest.lib", "libgtest.so"}
+        gmock_names = {"libgmock.a", "gmock.lib", "libgmock.so"}
 
         for root in candidate_roots:
             if not os.path.isdir(root):
@@ -360,45 +579,21 @@ class LLMUTWorkflow:
                         gtest_main_lib = full_path
                     elif file_name in lib_names and gtest_lib is None:
                         gtest_lib = full_path
-                if gtest_main_lib and gtest_lib:
+                    elif file_name in gmock_names and gmock_lib is None:
+                        gmock_lib = full_path
+                if gtest_main_lib and gtest_lib and gmock_lib:
                     break
-            if gtest_main_lib and gtest_lib:
+            if gtest_main_lib and gtest_lib and gmock_lib:
                 break
 
-        if gtest_main_lib and gtest_lib:
-            print(f"[Link] Using local gtest libs: {gtest_main_lib}, {gtest_lib}")
-            return [gtest_main_lib, gtest_lib]
+        if gtest_main_lib and gtest_lib and gmock_lib:
+            print(f"[Link] Using local gtest/gmock libs: {gtest_main_lib}, {gtest_lib}, {gmock_lib}")
+            return [gmock_lib, gtest_main_lib, gtest_lib]
 
         # 2) 查找gtest源码（避免依赖系统安装的 -lgtest）
-        gtest_root = None
-        for inc_flag in include_dirs:
-            if not inc_flag.startswith("-I"):
-                continue
-            inc_path = inc_flag[2:]
-            marker = os.path.join("googletest", "include")
-            if marker in inc_path:
-                gtest_root = inc_path.split(marker)[0] + "googletest"
-                break
-
-        if not gtest_root:
-            for root in candidate_roots:
-                candidate = os.path.join(root, "_deps", "googletest-src", "googletest")
-                if os.path.isdir(candidate):
-                    gtest_root = candidate
-                    break
-
-        if gtest_root:
-            gtest_all = os.path.join(gtest_root, "src", "gtest-all.cc")
-            gtest_main = os.path.join(gtest_root, "src", "gtest_main.cc")
-            if os.path.exists(gtest_all) and os.path.exists(gtest_main):
-                root_inc = f"-I{gtest_root}"
-                include_inc = f"-I{os.path.join(gtest_root, 'include')}"
-                if root_inc not in include_dirs:
-                    include_dirs.append(root_inc)
-                if include_inc not in include_dirs:
-                    include_dirs.append(include_inc)
-                print(f"[Link] Using gtest sources: {gtest_all}, {gtest_main}")
-                return [gtest_all, gtest_main]
+        source_inputs = _find_gtest_sources()
+        if source_inputs:
+            return source_inputs
 
         # 3) 回退到系统库
         print("[Link] Fallback to system gtest libs: -lgtest -lgtest_main")
@@ -415,13 +610,159 @@ class LLMUTWorkflow:
             or "cannot find -lgtest_main" in lower
             or "ld returned 1 exit status" in lower and "cannot find -l" in lower
             or "library not found for -lgtest" in lower
+            or "lnk2005" in lower
+            or "lnk2038" in lower
+            or "lnk1561" in lower
+            or "must define an entry point" in lower
+            or "invalid argument '-std=c++14' not allowed with 'c'" in lower
+            or "clang++: error: invalid argument" in lower
         )
+
+    @staticmethod
+    def _extract_unresolved_symbols(error_text: str) -> List[str]:
+        """从链接错误输出中提取未解析符号名。"""
+        if not error_text:
+            return []
+
+        patterns = [
+            r"无法解析的外部符号\s+([A-Za-z_][A-Za-z0-9_]*)",
+            r"unresolved external symbol\s+([A-Za-z_][A-Za-z0-9_]*)",
+            r"undefined reference to [`']([A-Za-z_][A-Za-z0-9_]*)",
+        ]
+
+        skip = {
+            "main",
+            "WinMain",
+            "DllMain",
+        }
+
+        symbols: List[str] = []
+        seen = set()
+        for pattern in patterns:
+            for match in re.findall(pattern, error_text, flags=re.IGNORECASE):
+                symbol = match.strip()
+                if not symbol or symbol in skip or symbol.startswith("__"):
+                    continue
+                if symbol not in seen:
+                    seen.add(symbol)
+                    symbols.append(symbol)
+
+        return symbols
+
+    def _inject_linker_stubs(self, test_path: str, symbols: List[str]) -> List[str]:
+        """向测试文件注入最小C链接桩函数，解决与目标测试无关的未解析符号。"""
+        if not symbols:
+            return []
+
+        with open(test_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        function_map = self.code_analyzer.get_all_functions()
+        stubs: List[str] = []
+        vars_to_define: List[str] = []
+        injected_symbols: List[str] = []
+
+        for symbol in symbols:
+            if symbol == "g_next_id":
+                has_definition = re.search(
+                    r"(?:^|\n)\s*(?:static\s+)?(?:extern\s+)?[A-Za-z_][A-Za-z0-9_\s\*]*\bg_next_id\s*=",
+                    content
+                ) is not None
+                if not has_definition:
+                    vars_to_define.append("int32_t g_next_id = 0;")
+                    injected_symbols.append(symbol)
+                continue
+
+            if re.search(rf"\b{re.escape(symbol)}\s*\(", content):
+                continue
+
+            func_dep = function_map.get(symbol)
+            if not func_dep:
+                continue
+
+            return_type = (func_dep.return_type or "int").strip()
+            params = func_dep.parameters or []
+            if not params:
+                param_sig = "void"
+            else:
+                param_parts: List[str] = []
+                for idx, param in enumerate(params):
+                    ptype = (param[0] or "int").strip()
+                    pname = (param[1] or f"arg{idx}").strip()
+
+                    while pname.startswith("*"):
+                        ptype += " *"
+                        pname = pname[1:].strip()
+
+                    if not pname:
+                        pname = f"arg{idx}"
+
+                    param_parts.append(f"{ptype} {pname}")
+                param_sig = ", ".join(param_parts)
+
+            if return_type == "void":
+                body = "return;"
+            else:
+                body = f"return ({return_type})0;"
+
+            stubs.append(f"{return_type} {symbol}({param_sig}) {{ {body} }}")
+            injected_symbols.append(symbol)
+
+        if not stubs and not vars_to_define:
+            return []
+
+        block_lines = []
+        if vars_to_define:
+            block_lines.extend(vars_to_define)
+        if stubs:
+            block_lines.append('extern "C" {')
+            block_lines.extend(stubs)
+            block_lines.append("}")
+
+        block = "\n\n" + "\n".join(block_lines) + "\n"
+        with open(test_path, 'w', encoding='utf-8') as f:
+            f.write(content.rstrip() + block + "\n")
+
+        return injected_symbols
+
+    @staticmethod
+    def _find_tool(tool_name: str) -> Optional[str]:
+        """查找工具可执行文件，支持PATH和常见Windows安装目录兜底。"""
+        found = shutil.which(tool_name)
+        if found:
+            return found
+
+        if os.name == 'nt':
+            common_paths = {
+                "clang++": ["C:/Program Files/LLVM/bin/clang++.exe"],
+                "clang-format": ["C:/Program Files/LLVM/bin/clang-format.exe"],
+                "clang-tidy": ["C:/Program Files/LLVM/bin/clang-tidy.exe"],
+                "cppcheck": [
+                    "C:/Program Files/cppcheck/cppcheck.exe",
+                    "C:/Program Files (x86)/Cppcheck/cppcheck.exe",
+                ],
+            }
+            for path in common_paths.get(tool_name, []):
+                if os.path.exists(path):
+                    return path
+
+        return None
 
     @staticmethod
     def _detect_cpp_compiler() -> Optional[str]:
         """检测可用的C++编译器，优先顺序适配Windows/Linux。"""
+        configured = os.getenv("CXX")
+        if configured:
+            configured = configured.strip()
+            if configured:
+                if os.path.exists(configured):
+                    return configured
+                configured_which = shutil.which(configured)
+                if configured_which:
+                    return configured_which
+
         for compiler in ["g++", "clang++", "cl"]:
-            path = shutil.which(compiler)
+            path = LLMUTWorkflow._find_tool(compiler)
             if path:
                 return path
         return None
@@ -446,7 +787,10 @@ class LLMUTWorkflow:
                 if inc.startswith("-I"):
                     cmd.append(f"/I{inc[2:]}")
 
-            cmd.extend(source_files)
+            if source_files:
+                cmd.append("/TC")
+                cmd.extend(source_files)
+            cmd.append("/TP")
             cmd.append(test_path)
 
             for item in gtest_link_inputs:
@@ -459,18 +803,49 @@ class LLMUTWorkflow:
             return cmd
 
         # GCC/Clang 风格
-        cmd = [compiler_path, "-std=c++14", "-o", exe_path]
+        cmd = [
+            compiler_path,
+            "-std=c++14",
+            "-D_CRT_SECURE_NO_WARNINGS",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-Wno-deprecated",
+            "-Wno-deprecated-declarations",
+            "-o",
+            exe_path
+        ]
         cmd.extend(include_dirs)
         cmd.append("-I/usr/include/gtest")
+        # 对clang++/g++直接传入.c与.cpp，避免-std与-x c冲突
         cmd.extend(source_files)
         cmd.append(test_path)
         cmd.extend(gtest_link_inputs)
+
+        if os.name == 'nt':
+            cmd.append("-Wl,/OPT:REF")
 
         # Windows上使用MinGW可加上pthread，MSVC路径不需要
         if os.name != 'nt':
             cmd.append("-lpthread")
 
         return cmd
+
+    def _resolve_source_files_for_test(self, test_name: str, all_sources: List[str]) -> List[str]:
+        """按测试名解析最小源文件集合，避免不必要的重复符号链接。"""
+        function_name = test_name.replace("_llm_test", "")
+        function_map = self.code_analyzer.get_all_functions()
+        func_dep = function_map.get(function_name)
+        if not func_dep:
+            return all_sources
+
+        source_file = func_dep.source_file
+        source_path = source_file if os.path.isabs(source_file) else os.path.join(self.project_dir, source_file)
+        source_path = os.path.abspath(source_path)
+
+        if os.path.exists(source_path):
+            return [source_path]
+
+        return all_sources
     
     def run_tests(self, test_dir: Optional[str] = None,
                   build_dir: str = "build-test",
@@ -581,11 +956,17 @@ class LLMUTWorkflow:
                             include_dirs.append(include_flag)
             
             # 准备编译命令
-            gtest_link_inputs = self._resolve_gtest_link_inputs(include_dirs, build_path)
+            source_files_for_test = self._resolve_source_files_for_test(test_name, source_files)
+
+            gtest_link_inputs = self._resolve_gtest_link_inputs(
+                include_dirs,
+                build_path,
+                prefer_sources=(os.name == 'nt' and not self._is_msvc_compiler(compiler_path))
+            )
             compile_cmd = self._build_compile_command(
                 compiler_path=compiler_path,
                 include_dirs=include_dirs,
-                source_files=source_files,
+                source_files=source_files_for_test,
                 test_path=test_path,
                 exe_path=exe_path,
                 gtest_link_inputs=gtest_link_inputs
@@ -595,11 +976,17 @@ class LLMUTWorkflow:
                 compile_result = None
                 compile_success = False
 
-                for attempt in range(max_fix_attempts + 1):
-                    if attempt == 0:
+                compile_round = 0
+                llm_fix_count = 0
+                max_compile_rounds = max_fix_attempts + 2
+
+                while compile_round < max_compile_rounds:
+                    if compile_round == 0:
                         print(f"Compiling: {test_name}...")
                     else:
-                        print(f"Compiling after auto-fix attempt {attempt}/{max_fix_attempts}: {test_name}...")
+                        print(
+                            f"Compiling after retry {compile_round}/{max_compile_rounds - 1}: {test_name}..."
+                        )
 
                     compile_result = subprocess.run(
                         compile_cmd,
@@ -623,7 +1010,7 @@ class LLMUTWorkflow:
                             print(f"    ... (more errors)")
 
                     # 记录每轮编译失败日志
-                    compile_log_path = os.path.join(log_dir, f"{test_name}_compile_attempt{attempt}_{timestamp}.log")
+                    compile_log_path = os.path.join(log_dir, f"{test_name}_compile_attempt{compile_round}_{timestamp}.log")
                     with open(compile_log_path, 'w', encoding='utf-8') as log_file:
                         log_file.write("Compile command:\n")
                         log_file.write(" ".join(compile_cmd) + "\n\n")
@@ -633,6 +1020,22 @@ class LLMUTWorkflow:
                         log_file.write(compile_result.stderr or "")
                     print(f"  ↳ Compile log saved: {compile_log_path}")
 
+                    unresolved_symbols = self._extract_unresolved_symbols(
+                        (compile_result.stderr or "") + "\n" + (compile_result.stdout or "")
+                    )
+                    if unresolved_symbols:
+                        injected_symbols = self._inject_linker_stubs(test_path, unresolved_symbols)
+                        if injected_symbols:
+                            print(
+                                f"  [Fix] Injected {len(injected_symbols)} linker stub(s): "
+                                + ", ".join(injected_symbols[:6])
+                                + (" ..." if len(injected_symbols) > 6 else "")
+                            )
+                            if compile_round >= max_compile_rounds - 1:
+                                max_compile_rounds += 1
+                            compile_round += 1
+                            continue
+
                     # 工具链/依赖错误：无需进入LLM修复阶段
                     if self._is_toolchain_link_error(compile_result.stderr or ""):
                         print("  ⚠ Linker/toolchain error detected (e.g. missing gtest library).")
@@ -640,11 +1043,11 @@ class LLMUTWorkflow:
                         break
 
                     # 到达重试上限或未启用自动修复
-                    if (not auto_fix_compile_errors) or attempt >= max_fix_attempts:
+                    if (not auto_fix_compile_errors) or llm_fix_count >= max_fix_attempts:
                         break
 
                     # 进入查错修复阶段
-                    print(f"  [Fix] Entering auto-fix phase ({attempt + 1}/{max_fix_attempts})...")
+                    print(f"  [Fix] Entering auto-fix phase ({llm_fix_count + 1}/{max_fix_attempts})...")
                     try:
                         with open(test_path, 'r', encoding='utf-8') as f:
                             current_test_code = f.read()
@@ -658,7 +1061,7 @@ class LLMUTWorkflow:
                         with open(test_path, 'w', encoding='utf-8') as f:
                             f.write(fixed_test_code)
 
-                        fix_log_path = os.path.join(log_dir, f"{test_name}_autofix_attempt{attempt + 1}_{timestamp}.log")
+                        fix_log_path = os.path.join(log_dir, f"{test_name}_autofix_attempt{llm_fix_count + 1}_{timestamp}.log")
                         with open(fix_log_path, 'w', encoding='utf-8') as log_file:
                             log_file.write("Auto-fix triggered by compile error.\n\n")
                             log_file.write("Original compile stderr (truncated to 8000 chars):\n")
@@ -668,6 +1071,8 @@ class LLMUTWorkflow:
 
                         print(f"  ↳ Auto-fix applied and saved: {test_path}")
                         print(f"  ↳ Auto-fix log saved: {fix_log_path}")
+                        llm_fix_count += 1
+                        compile_round += 1
                     except Exception as fix_error:
                         print(f"  ✗ Auto-fix failed: {fix_error}")
                         break
@@ -781,7 +1186,9 @@ Usage:
                           target_functions: Optional[List[str]] = None,
                           skip_run: bool = False,
                           auto_fix_compile_errors: bool = True,
-                          max_fix_attempts: int = 2) -> None:
+                          max_fix_attempts: int = 2,
+                          skip_quality_gates: bool = False,
+                          quality_strict: bool = False) -> None:
         """
         运行完整工作流
         
@@ -790,6 +1197,8 @@ Usage:
             skip_run: 是否跳过测试执行步骤
             auto_fix_compile_errors: 编译失败后是否自动进入LLM修复阶段
             max_fix_attempts: 最大自动修复重试次数
+            skip_quality_gates: 是否跳过clang-format/clang-tidy/cppcheck质量闸门
+            quality_strict: 质量闸门严格模式（有问题即停止）
         """
         self.show_workflow_info()
         self.analyze_codebase()
@@ -804,6 +1213,13 @@ Usage:
             print("\n" + "=" * 60)
             print("✓ Workflow completed (generation only, verification failed).")
             return
+
+        if not skip_quality_gates:
+            quality_ok = self.run_quality_gates(strict=quality_strict)
+            if not quality_ok:
+                print("\n" + "=" * 60)
+                print("✓ Workflow completed (stopped by quality gates).")
+                return
         
         if not skip_run:
             self.run_tests(
@@ -919,8 +1335,23 @@ def main():
         default=2,
         help="Max retry attempts for compile error auto-fix (default: 2)"
     )
+
+    parser.add_argument(
+        "--skip-quality-gates",
+        action="store_true",
+        help="Skip quality gates (clang-format / clang-tidy / cppcheck)"
+    )
+
+    parser.add_argument(
+        "--quality-strict",
+        action="store_true",
+        help="Enable strict quality gates (stop workflow when any quality tool reports issues)"
+    )
     
     args = parser.parse_args()
+
+    effective_skip_quality_gates = args.skip_quality_gates
+    effective_quality_strict = args.quality_strict
     
     # 优先从配置文件加载
     if args.config:
@@ -931,6 +1362,15 @@ def main():
                 project_root_override=args.project_dir if args.project_dir != "." else None,
                 compile_commands_override=args.compile_commands if args.compile_commands != "build/compile_commands.json" else None
             )
+
+            # 从配置读取quality_gates默认值（命令行显式参数优先）
+            with open(args.config, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+            quality_cfg = cfg.get('test_generation', {}).get('quality_gates', {})
+            if not args.skip_quality_gates and quality_cfg.get('enabled') is False:
+                effective_skip_quality_gates = True
+            if not args.quality_strict and quality_cfg.get('strict') is True:
+                effective_quality_strict = True
         except Exception as e:
             print(f"✗ Failed to load config: {e}")
             sys.exit(1)
@@ -963,7 +1403,9 @@ def main():
             target_functions=args.functions,
             skip_run=args.skip_run,
             auto_fix_compile_errors=not args.no_auto_fix_compile,
-            max_fix_attempts=max(0, args.max_fix_attempts)
+            max_fix_attempts=max(0, args.max_fix_attempts),
+            skip_quality_gates=effective_skip_quality_gates,
+            quality_strict=effective_quality_strict
         )
 
 

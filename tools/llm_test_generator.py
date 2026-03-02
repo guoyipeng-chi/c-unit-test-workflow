@@ -191,6 +191,8 @@ Critical constraints (must follow):
 - Do NOT implement/define production C functions in this test file.
 - The target function and other project C symbols must come from linked production object files.
 - If you need C linkage, use extern "C" only for includes/declarations, never for function bodies.
+- Preserve exact function signatures from headers (including const qualifiers); never change them in mocks/wrappers.
+- Do NOT reference internal/static production globals (for example g_next_id). Validate behavior via return values and mocked call arguments instead.
 
 Return ONLY the C++ code, no markdown wrappers."""
         
@@ -315,7 +317,9 @@ Requirements:
 2. Fix include errors, type/signature mismatches, mock declarations, and syntax errors.
 3. Keep using Google Test / Google Mock.
 4. NEVER define/re-implement production C functions in test file.
-5. Return ONLY the complete updated C++ test file.
+5. Preserve exact production signatures from headers (const/ptr qualifiers).
+6. Do NOT reference internal/static globals such as g_next_id.
+7. Return ONLY the complete updated C++ test file.
 
 Target Function: {function_name}
 
@@ -347,7 +351,10 @@ Target Function: {function_name}
             logger.warning(f"Empty fixed code for {function_name}, keep original code")
             return current_test_code
 
-        fixed_code = self._sanitize_generated_test_code(fixed_code, forbidden_symbols=[function_name])
+        extra_forbidden = re.findall(r"conflicting types for '([A-Za-z_][A-Za-z0-9_]*)'", compile_error)
+        unresolved_forbidden = re.findall(r"无法解析的外部符号\s+([A-Za-z_][A-Za-z0-9_]*)", compile_error)
+        forbidden_symbols = [function_name] + extra_forbidden + unresolved_forbidden
+        fixed_code = self._sanitize_generated_test_code(fixed_code, forbidden_symbols=forbidden_symbols)
 
         return fixed_code
     
