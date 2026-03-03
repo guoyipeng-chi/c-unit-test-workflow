@@ -1155,6 +1155,69 @@ class LLMUTWorkflow:
                 dedup.append(item)
         return dedup
 
+    @staticmethod
+    def _remove_symbol_definitions_from_code(content: str,
+                                             symbols: List[str],
+                                             protected_symbols: Optional[List[str]] = None) -> (str, List[str]):
+        """从代码文本中移除指定符号函数定义，返回(新代码, 移除符号列表)。"""
+        if not symbols:
+            return content, []
+
+        protected = {s for s in (protected_symbols or []) if s}
+        updated = content
+        removed_symbols: List[str] = []
+
+        for symbol in symbols:
+            if symbol in protected:
+                continue
+
+            pattern = re.compile(
+                rf'\b{re.escape(symbol)}\s*\([^;{{}}]*\)\s*\{{',
+                re.MULTILINE
+            )
+
+            search_pos = 0
+            while True:
+                match = pattern.search(updated, search_pos)
+                if not match:
+                    break
+
+                brace_open = updated.find('{', match.end() - 1)
+                if brace_open == -1:
+                    break
+
+                brace_count = 1
+                end_pos = brace_open + 1
+                while end_pos < len(updated) and brace_count > 0:
+                    ch = updated[end_pos]
+                    if ch == '{':
+                        brace_count += 1
+                    elif ch == '}':
+                        brace_count -= 1
+                    end_pos += 1
+
+                if brace_count != 0:
+                    search_pos = match.end()
+                    continue
+
+                line_start = updated.rfind('\n', 0, match.start())
+                line_start = 0 if line_start == -1 else line_start + 1
+                delete_end = end_pos
+                if delete_end < len(updated) and updated[delete_end:delete_end + 1] == '\n':
+                    delete_end += 1
+
+                updated = updated[:line_start] + updated[delete_end:]
+                removed_symbols.append(symbol)
+                search_pos = line_start
+
+        dedup: List[str] = []
+        seen = set()
+        for item in removed_symbols:
+            if item not in seen:
+                seen.add(item)
+                dedup.append(item)
+        return updated, dedup
+
     def _inject_linker_stubs(self, test_path: str, symbols: List[str]) -> List[str]:
         """向测试文件注入最小C链接桩函数，解决与目标测试无关的未解析符号。"""
         if not symbols:
@@ -1614,6 +1677,7 @@ class LLMUTWorkflow:
                 runtime_prev_failed_tests = None
                 test_finished = False
                 same_tu_unmockable_symbols = self._get_same_tu_unmockable_symbols(target_symbol)
+                blocked_redefinition_symbols = set(same_tu_unmockable_symbols)
 
                 if same_tu_unmockable_symbols:
                     with open(test_path, 'r', encoding='utf-8') as f:
@@ -1696,6 +1760,7 @@ class LLMUTWorkflow:
                                 protected_symbols=[test_name.replace("_llm_test", "")]
                             )
                             if removed_symbols:
+                                blocked_redefinition_symbols.update(removed_symbols)
                                 with open(test_path, 'r', encoding='utf-8') as f:
                                     detfix_after_code = f.read()
                                 self._emit_fix_diff(
@@ -1955,6 +2020,21 @@ class LLMUTWorkflow:
                                     compile_analysis=triage_result if llm_triage_enabled else None,
                                     aggressive=True
                                 )
+
+                            if blocked_redefinition_symbols:
+                                sanitized_code, stripped_symbols = self._remove_symbol_definitions_from_code(
+                                    fixed_test_code,
+                                    sorted(list(blocked_redefinition_symbols)),
+                                    protected_symbols=[target_symbol]
+                                )
+                                if stripped_symbols:
+                                    self._print_key_event(
+                                        "[AntiOscillation] Stripped forbidden redefinitions from compile fix: "
+                                        + ", ".join(stripped_symbols[:6])
+                                        + (" ..." if len(stripped_symbols) > 6 else ""),
+                                        bg_code="45"
+                                    )
+                                    fixed_test_code = sanitized_code
 
                             with open(test_path, 'w', encoding='utf-8') as f:
                                 f.write(fixed_test_code)
@@ -2385,6 +2465,21 @@ class LLMUTWorkflow:
                                 failure_analysis=runtime_triage_result if llm_triage_enabled else None,
                                 aggressive=True
                             )
+
+                        if blocked_redefinition_symbols:
+                            sanitized_code, stripped_symbols = self._remove_symbol_definitions_from_code(
+                                fixed_test_code,
+                                sorted(list(blocked_redefinition_symbols)),
+                                protected_symbols=[target_symbol]
+                            )
+                            if stripped_symbols:
+                                self._print_key_event(
+                                    "[AntiOscillation] Stripped forbidden redefinitions from runtime fix: "
+                                    + ", ".join(stripped_symbols[:6])
+                                    + (" ..." if len(stripped_symbols) > 6 else ""),
+                                    bg_code="45"
+                                )
+                                fixed_test_code = sanitized_code
 
                         with open(test_path, 'w', encoding='utf-8') as f:
                             f.write(fixed_test_code)
