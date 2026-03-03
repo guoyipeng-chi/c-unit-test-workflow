@@ -248,6 +248,77 @@ class LLMUTWorkflow:
         return preview
 
     @staticmethod
+    def _build_unified_diff(before_code: str,
+                            after_code: str,
+                            fromfile: str = "before",
+                            tofile: str = "after",
+                            max_lines: Optional[int] = None) -> str:
+        if before_code == after_code:
+            return ""
+
+        diff_lines = list(
+            difflib.unified_diff(
+                before_code.splitlines(),
+                after_code.splitlines(),
+                fromfile=fromfile,
+                tofile=tofile,
+                lineterm=""
+            )
+        )
+        if not diff_lines:
+            return ""
+
+        if max_lines is not None and max_lines > 0 and len(diff_lines) > max_lines:
+            return "\n".join(diff_lines[:max_lines]) + "\n..."
+
+        return "\n".join(diff_lines)
+
+    def _emit_fix_diff(self,
+                       before_code: str,
+                       after_code: str,
+                       log_dir: str,
+                       test_name: str,
+                       phase: str,
+                       attempt: int,
+                       timestamp: str,
+                       preview_max_lines: int = 40) -> str:
+        """输出修复diff预览并保存完整patch日志，返回patch路径（无变化则返回空字符串）。"""
+        full_diff = self._build_unified_diff(
+            before_code,
+            after_code,
+            fromfile=f"{test_name}.before.cpp",
+            tofile=f"{test_name}.after.cpp"
+        )
+        if not full_diff:
+            self._print_key_event("[Diff] No textual changes after fix step", bg_code="45")
+            return ""
+
+        preview = self._build_unified_diff(
+            before_code,
+            after_code,
+            fromfile=f"{test_name}.before.cpp",
+            tofile=f"{test_name}.after.cpp",
+            max_lines=preview_max_lines
+        )
+        self._print_key_event(
+            f"[Diff] {phase} auto-fix attempt {attempt} patch preview",
+            bg_code="44"
+        )
+        for line in (preview or "").splitlines():
+            print(f"    {line}")
+
+        diff_log_path = os.path.join(
+            log_dir,
+            f"{test_name}_{phase}_diff_attempt{attempt}_{timestamp}.patch"
+        )
+        with open(diff_log_path, 'w', encoding='utf-8') as diff_file:
+            diff_file.write(full_diff)
+            diff_file.write("\n")
+
+        print(f"  ↳ Diff patch saved: {diff_log_path}")
+        return diff_log_path
+
+    @staticmethod
     def _ansi_enabled() -> bool:
         if os.environ.get("NO_COLOR"):
             return False
@@ -1844,11 +1915,25 @@ class LLMUTWorkflow:
                             with open(test_path, 'w', encoding='utf-8') as f:
                                 f.write(fixed_test_code)
 
+                            diff_log_path = self._emit_fix_diff(
+                                before_code=before_fix_code,
+                                after_code=fixed_test_code,
+                                log_dir=log_dir,
+                                test_name=test_name,
+                                phase="compile",
+                                attempt=llm_fix_count + 1,
+                                timestamp=timestamp
+                            )
+
                             fix_log_path = os.path.join(log_dir, f"{test_name}_autofix_attempt{llm_fix_count + 1}_{timestamp}.log")
                             with open(fix_log_path, 'w', encoding='utf-8') as log_file:
                                 log_file.write("Auto-fix triggered by compile error.\n\n")
                                 log_file.write("Original compile stderr (truncated to 8000 chars):\n")
                                 log_file.write((compile_result.stderr or "")[:8000])
+                                if diff_log_path:
+                                    log_file.write("\n\nUnified diff patch log:\n")
+                                    log_file.write(diff_log_path)
+                                    log_file.write("\n")
                                 log_file.write("\n\nUpdated test file:\n")
                                 log_file.write(fixed_test_code)
 
@@ -2247,6 +2332,16 @@ class LLMUTWorkflow:
                         with open(test_path, 'w', encoding='utf-8') as f:
                             f.write(fixed_test_code)
 
+                        diff_log_path = self._emit_fix_diff(
+                            before_code=before_fix_code,
+                            after_code=fixed_test_code,
+                            log_dir=log_dir,
+                            test_name=test_name,
+                            phase="runtime",
+                            attempt=runtime_fix_count + 1,
+                            timestamp=timestamp
+                        )
+
                         fix_log_path = os.path.join(
                             log_dir,
                             f"{test_name}_run_autofix_attempt{runtime_fix_count + 1}_{timestamp}.log"
@@ -2255,6 +2350,10 @@ class LLMUTWorkflow:
                             log_file.write("Auto-fix triggered by test runtime failure.\n\n")
                             log_file.write("Original run output (truncated to 8000 chars):\n")
                             log_file.write(run_output[:8000])
+                            if diff_log_path:
+                                log_file.write("\n\nUnified diff patch log:\n")
+                                log_file.write(diff_log_path)
+                                log_file.write("\n")
                             log_file.write("\n\nUpdated test file:\n")
                             log_file.write(fixed_test_code)
 
