@@ -553,11 +553,32 @@ class LLMUTWorkflow:
             
             # 获取编译信息
             compile_info = compile_info_map.get(fdep.source_file)
+
+            same_tu_symbols = sorted([
+                other_name
+                for other_name, other_dep in functions.items()
+                if other_name != fname and other_dep.source_file == fdep.source_file
+            ])
+            same_tu_external_calls = sorted([
+                symbol for symbol in fdep.external_calls
+                if symbol in same_tu_symbols
+            ])
+
+            extra_context = ""
+            if same_tu_external_calls:
+                extra_context = (
+                    "Linkage constraint: The following called symbols are implemented in the same "
+                    f"source file as target function '{fname}': "
+                    + ", ".join(same_tu_external_calls)
+                    + ". Do NOT redefine/mock-wrap these symbols in test file; "
+                      "let production object provide them to avoid duplicate-definition linker errors."
+                )
             
             # 生成测试（传递项目根目录）
             test_code = self.test_generator.generate_test_file(
                 fdep,
                 compile_info=compile_info,
+                extra_context=extra_context,
                 project_root=self.project_dir
             )
             
@@ -953,6 +974,98 @@ class LLMUTWorkflow:
 
         return symbols
 
+    @staticmethod
+    def _extract_duplicate_symbols(error_text: str) -> List[str]:
+        """从链接重复定义错误输出中提取符号名。"""
+        if not error_text:
+            return []
+
+        patterns = [
+            r"\b([A-Za-z_][A-Za-z0-9_]*)\s+已经在\s+.*中定义",
+            r"LNK2005\s+([A-Za-z_][A-Za-z0-9_]*)\s+already defined",
+            r"multiple definition of [`']([A-Za-z_][A-Za-z0-9_]*)",
+        ]
+
+        symbols: List[str] = []
+        seen = set()
+        for pattern in patterns:
+            for match in re.findall(pattern, error_text, flags=re.IGNORECASE):
+                symbol = str(match).strip()
+                if symbol and symbol not in seen:
+                    seen.add(symbol)
+                    symbols.append(symbol)
+        return symbols
+
+    @staticmethod
+    def _remove_symbol_definitions_from_test_file(test_path: str,
+                                                  symbols: List[str],
+                                                  protected_symbols: Optional[List[str]] = None) -> List[str]:
+        """从测试文件移除指定符号函数定义，用于解决重复定义冲突。"""
+        if not symbols:
+            return []
+
+        protected = {s for s in (protected_symbols or []) if s}
+
+        with open(test_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        removed_symbols: List[str] = []
+        for symbol in symbols:
+            if symbol in protected:
+                continue
+
+            pattern = re.compile(
+                rf'\b{re.escape(symbol)}\s*\([^;{{}}]*\)\s*\{{',
+                re.MULTILINE
+            )
+
+            search_pos = 0
+            while True:
+                match = pattern.search(content, search_pos)
+                if not match:
+                    break
+
+                brace_open = content.find('{', match.end() - 1)
+                if brace_open == -1:
+                    break
+
+                brace_count = 1
+                end_pos = brace_open + 1
+                while end_pos < len(content) and brace_count > 0:
+                    ch = content[end_pos]
+                    if ch == '{':
+                        brace_count += 1
+                    elif ch == '}':
+                        brace_count -= 1
+                    end_pos += 1
+
+                if brace_count != 0:
+                    search_pos = match.end()
+                    continue
+
+                line_start = content.rfind('\n', 0, match.start())
+                line_start = 0 if line_start == -1 else line_start + 1
+                delete_end = end_pos
+                if delete_end < len(content) and content[delete_end:delete_end + 1] == '\n':
+                    delete_end += 1
+
+                content = content[:line_start] + content[delete_end:]
+                removed_symbols.append(symbol)
+                search_pos = line_start
+
+        if removed_symbols:
+            with open(test_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+
+        # 去重保序
+        dedup: List[str] = []
+        seen = set()
+        for item in removed_symbols:
+            if item not in seen:
+                seen.add(item)
+                dedup.append(item)
+        return dedup
+
     def _inject_linker_stubs(self, test_path: str, symbols: List[str]) -> List[str]:
         """向测试文件注入最小C链接桩函数，解决与目标测试无关的未解析符号。"""
         if not symbols:
@@ -1028,6 +1141,103 @@ class LLMUTWorkflow:
             f.write(content.rstrip() + block + "\n")
 
         return injected_symbols
+
+    @staticmethod
+    def _c_symbol_to_mock_method_name(symbol: str) -> str:
+        """将C符号名映射为常见Mock方法命名（snake_case -> PascalCase）。"""
+        raw = str(symbol or "").strip().strip("_")
+        if not raw:
+            return ""
+        parts = [p for p in re.split(r"_+", raw) if p]
+        return "".join(part[:1].upper() + part[1:] for part in parts)
+
+    @staticmethod
+    def _extract_never_called_mock_methods(runtime_output: str) -> List[str]:
+        """从gMock输出中提取 never called 的 EXPECT_CALL 方法名。"""
+        if not runtime_output:
+            return []
+
+        pattern = re.compile(
+            r"EXPECT_CALL\(\s*mock_\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*\([^\)]*\)\s*\)"
+            r"[\s\S]{0,400}?never called",
+            re.IGNORECASE
+        )
+
+        methods: List[str] = []
+        seen = set()
+        for match in pattern.findall(runtime_output):
+            method = str(match).strip()
+            if method and method not in seen:
+                seen.add(method)
+                methods.append(method)
+        return methods
+
+    @staticmethod
+    def _remove_expect_call_blocks_for_methods(test_path: str,
+                                               method_names: List[str]) -> List[str]:
+        """从测试文件中移除指定方法的 EXPECT_CALL 语句块（含链式 Times/WillOnce）。"""
+        if not method_names:
+            return []
+
+        with open(test_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        removed: List[str] = []
+        for method in method_names:
+            method = str(method or "").strip()
+            if not method:
+                continue
+
+            pattern = re.compile(
+                rf"^[ \t]*EXPECT_CALL\(\s*mock_\s*,\s*{re.escape(method)}\s*\([^\)]*\)\s*\)"
+                rf"[\s\S]*?;[ \t]*\n?",
+                re.MULTILINE
+            )
+
+            changed = False
+            while True:
+                new_content, count = pattern.subn("", content, count=1)
+                if count <= 0:
+                    break
+                content = new_content
+                changed = True
+
+            if changed:
+                removed.append(method)
+
+        if removed:
+            with open(test_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+
+        return removed
+
+    def _get_same_tu_unmockable_symbols(self, target_symbol: str) -> List[str]:
+        """找出目标函数 external_calls 中与其同源文件定义的符号（不应在测试里重定义/mock-wrapper）。"""
+        symbol = str(target_symbol or "").strip()
+        if not symbol:
+            return []
+
+        try:
+            functions = self.code_analyzer.get_all_functions()
+        except Exception:
+            return []
+
+        dep = functions.get(symbol)
+        if not dep:
+            return []
+
+        same_tu_symbols: List[str] = []
+        for callee in (dep.external_calls or []):
+            callee_name = str(callee or "").strip()
+            if not callee_name:
+                continue
+            callee_dep = functions.get(callee_name)
+            if not callee_dep:
+                continue
+            if callee_dep.source_file == dep.source_file:
+                same_tu_symbols.append(callee_name)
+
+        return sorted(list(dict.fromkeys(same_tu_symbols)))
 
     @staticmethod
     def _find_tool(tool_name: str) -> Optional[str]:
@@ -1255,6 +1465,7 @@ class LLMUTWorkflow:
         for test_file in test_files:
             test_path = os.path.join(test_dir, test_file)
             test_name = os.path.splitext(test_file)[0]
+            target_symbol = test_name.replace("_llm_test", "")
             exe_path = os.path.join(build_path, test_name)
             if self._is_msvc_compiler(compiler_path) and not exe_path.lower().endswith('.exe'):
                 exe_path += '.exe'
@@ -1313,6 +1524,21 @@ class LLMUTWorkflow:
                 runtime_consumed_attempts = 0
                 runtime_prev_failed_tests = None
                 test_finished = False
+                same_tu_unmockable_symbols = self._get_same_tu_unmockable_symbols(target_symbol)
+
+                if same_tu_unmockable_symbols:
+                    pre_removed = self._remove_symbol_definitions_from_test_file(
+                        test_path=test_path,
+                        symbols=same_tu_unmockable_symbols,
+                        protected_symbols=[target_symbol]
+                    )
+                    if pre_removed:
+                        self._print_key_event(
+                            "[PreCheck] Removed same-TU symbol definitions before compile: "
+                            + ", ".join(pre_removed[:6])
+                            + (" ..." if len(pre_removed) > 6 else ""),
+                            bg_code="45"
+                        )
 
                 while not test_finished:
                     compile_success = False
@@ -1356,11 +1582,29 @@ class LLMUTWorkflow:
                             log_file.write(compile_result.stderr or "")
                         print(f"  ↳ Compile log saved: {compile_log_path}")
 
+                        compile_output_full = (compile_result.stdout or "") + "\n" + (compile_result.stderr or "")
+
+                        duplicate_symbols = self._extract_duplicate_symbols(compile_output_full)
+                        if duplicate_symbols:
+                            removed_symbols = self._remove_symbol_definitions_from_test_file(
+                                test_path=test_path,
+                                symbols=duplicate_symbols,
+                                protected_symbols=[test_name.replace("_llm_test", "")]
+                            )
+                            if removed_symbols:
+                                self._print_key_event(
+                                    "[DeterministicFix] Removed duplicate symbol definitions: "
+                                    + ", ".join(removed_symbols[:6])
+                                    + (" ..." if len(removed_symbols) > 6 else ""),
+                                    bg_code="45"
+                                )
+                                compile_round += 1
+                                continue
+
                         unresolved_symbols = self._extract_unresolved_symbols(
-                            (compile_result.stderr or "") + "\n" + (compile_result.stdout or "")
+                            compile_output_full
                         )
 
-                        target_symbol = test_name.replace("_llm_test", "")
                         if (
                             unresolved_symbols
                             and (not full_source_link_mode)
@@ -1423,7 +1667,7 @@ class LLMUTWorkflow:
                                 with open(test_path, 'r', encoding='utf-8') as f:
                                     current_test_code = f.read()
 
-                                compile_output = (compile_result.stderr or compile_result.stdout or "")
+                                compile_output = (compile_result.stdout or "") + "\n" + (compile_result.stderr or "")
                                 navigation_context = self.compile_analyzer.build_ordered_navigation_context(
                                     compiler_output=compile_output,
                                     key_symbols=[],
@@ -1524,7 +1768,7 @@ class LLMUTWorkflow:
                             except Exception as triage_error:
                                 print(f"  ⚠ Triage failed, fallback to direct fix: {triage_error}")
 
-                        compile_output = (compile_result.stderr or compile_result.stdout or "")
+                        compile_output = (compile_result.stdout or "") + "\n" + (compile_result.stderr or "")
                         issue_fingerprint = self._build_issue_fingerprint(
                             error_type=str(triage_result.get("error_type", "unknown")),
                             root_cause=str(triage_result.get("root_cause", "")),
@@ -1792,6 +2036,28 @@ class LLMUTWorkflow:
                             f"[RuntimeEvidence] mock_violations={len(mock_violations)}",
                             bg_code="45"
                         )
+
+                    never_called_methods = self._extract_never_called_mock_methods(evidence_output)
+                    if same_tu_unmockable_symbols and never_called_methods:
+                        blocked_methods = sorted([
+                            self._c_symbol_to_mock_method_name(sym)
+                            for sym in same_tu_unmockable_symbols
+                            if self._c_symbol_to_mock_method_name(sym) in never_called_methods
+                        ])
+                        if blocked_methods:
+                            removed_expect_calls = self._remove_expect_call_blocks_for_methods(
+                                test_path=test_path,
+                                method_names=blocked_methods
+                            )
+                            if removed_expect_calls:
+                                self._print_key_event(
+                                    "[DeterministicFix] Removed unreachable EXPECT_CALL blocks: "
+                                    + ", ".join(removed_expect_calls),
+                                    bg_code="45"
+                                )
+                                runtime_fix_count += 1
+                                compile_round = 0
+                                continue
 
                     if llm_triage_enabled:
                         try:
