@@ -47,6 +47,21 @@ class QuickStart:
                 "model": "qwen-coder"
             }
         }
+
+    @staticmethod
+    def _ansi_enabled() -> bool:
+        if os.environ.get("NO_COLOR"):
+            return False
+        term = (os.environ.get("TERM") or "").lower()
+        if term == "dumb":
+            return False
+        return True
+
+    @classmethod
+    def _gray_text(cls, text: str) -> str:
+        if not cls._ansi_enabled():
+            return text
+        return f"\033[90m{text}\033[0m"
     
     def _resolve_compiler(self) -> tuple[Optional[str], Optional[str]]:
         """解析可用C++编译器（优先配置项）。返回(compiler_path, detail_msg)。"""
@@ -242,7 +257,19 @@ class QuickStart:
                 else:
                     os.environ[key] = value
 
-    def _discover_functions_for_selection(self) -> List[Tuple[str, str]]:
+    def _discover_generated_function_names(self) -> set:
+        test_dir = self.project_root / self.config.get("paths", {}).get("test_dir", "test")
+        if not test_dir.exists():
+            return set()
+
+        generated = set()
+        for test_file in test_dir.glob("*_llm_test.cpp"):
+            stem = test_file.stem
+            if stem.endswith("_llm_test"):
+                generated.add(stem[:-9])
+        return generated
+
+    def _discover_functions_for_selection(self) -> List[Tuple[str, str, bool]]:
         include_dir = self.project_root / self.config.get("paths", {}).get("include_dir", "include")
         src_dir = self.project_root / self.config.get("paths", {}).get("src_dir", "src")
 
@@ -255,11 +282,12 @@ class QuickStart:
         analyzer = CCodeAnalyzer(str(include_dir), str(src_dir))
         analyzer.analyze_directory()
         funcs = analyzer.get_all_functions()
+        generated_names = self._discover_generated_function_names()
 
-        records: List[Tuple[str, str]] = []
+        records: List[Tuple[str, str, bool]] = []
         for name, dep in funcs.items():
             source = str(dep.source_file).replace('\\', '/')
-            records.append((name, source))
+            records.append((name, source, name in generated_names))
 
         records.sort(key=lambda item: item[0].lower())
         return records
@@ -325,34 +353,64 @@ class QuickStart:
             return None, True
 
         page_size = 12
-        total = len(records)
         current_page = 0
-        selected_indices = set()
-        function_names = [name for name, _ in records]
+        selected_record_indices = set()
+        only_ungenerated = False
+        function_names = [name for name, _, _ in records]
         restore_completion = self._with_function_tab_completion(function_names)
 
         try:
             while True:
+                visible_record_indices = [
+                    i for i, (_, _, is_generated) in enumerate(records)
+                    if (not only_ungenerated) or (not is_generated)
+                ]
+                total = len(visible_record_indices)
+                total_generated = sum(1 for _, _, is_generated in records if is_generated)
+                total_new = len(records) - total_generated
+
+                if total == 0:
+                    print("\n[Function Picker]")
+                    print("No functions visible under current filter (only ungenerated).")
+                    print("Commands: u(toggle filter), q(cancel)")
+                    raw = input("select> ").strip().lower()
+                    if raw in {"u", "ungenerated", "toggle"}:
+                        only_ungenerated = not only_ungenerated
+                        continue
+                    if raw in {"q", "quit", "cancel"}:
+                        return None, True
+                    continue
+
                 total_pages = max(1, (total + page_size - 1) // page_size)
                 current_page = max(0, min(current_page, total_pages - 1))
                 start = current_page * page_size
                 end = min(total, start + page_size)
 
                 print("\n[Function Picker]")
-                print(f"Page {current_page + 1}/{total_pages}, total functions: {total}")
-                print("Commands: n(next), p(prev), a(all), d(done), c(clear), q(cancel)")
+                filter_text = "ON" if only_ungenerated else "OFF"
+                print(
+                    f"Page {current_page + 1}/{total_pages}, visible: {total}, "
+                    f"all: {len(records)} (new={total_new}, generated={total_generated}), "
+                    f"only-ungenerated: {filter_text}"
+                )
+                print("Commands: n(next), p(prev), u(toggle ungenerated-only), a(all), d(done), c(clear), q(cancel)")
                 print("Input: number(s) like 1 3 8-12, or function name/prefix (Tab to complete)")
                 print("-" * 72)
 
-                for idx in range(start, end):
-                    name, src = records[idx]
-                    marker = "*" if (idx + 1) in selected_indices else " "
-                    print(f"{marker} {idx + 1:>3}. {name:<32} {src}")
+                for visible_idx in range(start, end):
+                    rec_idx = visible_record_indices[visible_idx]
+                    name, src, is_generated = records[rec_idx]
+                    marker = "*" if rec_idx in selected_record_indices else " "
+                    state = "GEN" if is_generated else "NEW"
+                    row = f"{marker} {visible_idx + 1:>3}. [{state}] {name:<26} {src}"
+                    if is_generated:
+                        row = self._gray_text(row)
+                    print(row)
 
-                if selected_indices:
-                    preview = [records[i - 1][0] for i in sorted(selected_indices)[:8]]
-                    tail = " ..." if len(selected_indices) > 8 else ""
-                    print(f"Selected({len(selected_indices)}): {', '.join(preview)}{tail}")
+                if selected_record_indices:
+                    preview = [records[i][0] for i in sorted(selected_record_indices)[:8]]
+                    tail = " ..." if len(selected_record_indices) > 8 else ""
+                    print(f"Selected({len(selected_record_indices)}): {', '.join(preview)}{tail}")
 
                 raw = input("select> ").strip()
                 if not raw:
@@ -365,55 +423,64 @@ class QuickStart:
                 if cmd in {"p", "prev"}:
                     current_page = max(current_page - 1, 0)
                     continue
+                if cmd in {"u", "ungenerated", "toggle"}:
+                    only_ungenerated = not only_ungenerated
+                    current_page = 0
+                    continue
                 if cmd in {"a", "all"}:
+                    if only_ungenerated:
+                        selected = [records[i][0] for i in visible_record_indices]
+                        print(f"✓ Select all visible ungenerated functions ({len(selected)})")
+                        return selected, False
                     print("✓ Select all functions")
                     return None, False
                 if cmd in {"c", "clear"}:
-                    selected_indices.clear()
+                    selected_record_indices.clear()
                     continue
                 if cmd in {"q", "quit", "cancel"}:
                     return None, True
                 if cmd in {"d", "done", "ok"}:
-                    if not selected_indices:
+                    if not selected_record_indices:
                         print("⚠ No selected function, use a/all or choose indices first.")
                         continue
-                    selected = [records[i - 1][0] for i in sorted(selected_indices)]
+                    selected = [records[i][0] for i in sorted(selected_record_indices)]
                     return selected, False
 
                 index_hits = self._parse_index_tokens(raw, total)
                 if index_hits:
-                    for idx in index_hits:
-                        if idx in selected_indices:
-                            selected_indices.remove(idx)
+                    for visible_idx in index_hits:
+                        rec_idx = visible_record_indices[visible_idx - 1]
+                        if rec_idx in selected_record_indices:
+                            selected_record_indices.remove(rec_idx)
                         else:
-                            selected_indices.add(idx)
+                            selected_record_indices.add(rec_idx)
                     continue
 
                 name_tokens = [t for t in re.split(r"[\s,]+", raw) if t]
                 matched_any = False
                 for token in name_tokens:
-                    exact = [i + 1 for i, (name, _) in enumerate(records) if name == token]
+                    exact = [i for i, (name, _, _) in enumerate(records) if name == token]
                     if exact:
-                        idx = exact[0]
-                        if idx in selected_indices:
-                            selected_indices.remove(idx)
+                        rec_idx = exact[0]
+                        if rec_idx in selected_record_indices:
+                            selected_record_indices.remove(rec_idx)
                         else:
-                            selected_indices.add(idx)
+                            selected_record_indices.add(rec_idx)
                         matched_any = True
                         continue
 
-                    pref = [i + 1 for i, (name, _) in enumerate(records) if name.lower().startswith(token.lower())]
+                    pref = [i for i, (name, _, _) in enumerate(records) if name.lower().startswith(token.lower())]
                     if len(pref) == 1:
-                        idx = pref[0]
-                        if idx in selected_indices:
-                            selected_indices.remove(idx)
+                        rec_idx = pref[0]
+                        if rec_idx in selected_record_indices:
+                            selected_record_indices.remove(rec_idx)
                         else:
-                            selected_indices.add(idx)
+                            selected_record_indices.add(rec_idx)
                         matched_any = True
                         continue
 
                     if len(pref) > 1:
-                        examples = ", ".join(records[i - 1][0] for i in pref[:8])
+                        examples = ", ".join(records[i][0] for i in pref[:8])
                         print(f"⚠ Prefix '{token}' matches multiple functions: {examples}")
                         matched_any = True
                         continue
