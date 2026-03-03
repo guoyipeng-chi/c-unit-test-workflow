@@ -1501,7 +1501,13 @@ class LLMUTWorkflow:
                                     triage_log.write(json.dumps(triage_result, ensure_ascii=False, indent=2))
                                 print(f"  ↳ Triage log saved: {triage_log_path}")
 
-                                if (not bool(triage_result.get("should_fix", True))) or triage_conf < triage_min_confidence:
+                                triage_unavailable = str(triage_result.get("root_cause", "")) == "triage_unavailable"
+                                if triage_unavailable:
+                                    self._print_key_event(
+                                        "[Triage] unavailable -> fallback to direct fix (ignore confidence gate)",
+                                        bg_code="45"
+                                    )
+                                elif (not bool(triage_result.get("should_fix", True))) or triage_conf < triage_min_confidence:
                                     print(
                                         f"  ⚠ Triage decided to skip fix "
                                         f"(should_fix={bool(triage_result.get('should_fix', True))}, "
@@ -1861,7 +1867,13 @@ class LLMUTWorkflow:
                                 triage_log.write(json.dumps(runtime_triage_result, ensure_ascii=False, indent=2))
                             print(f"  ↳ Run triage log saved: {triage_log_path}")
 
-                            if (not bool(runtime_triage_result.get("should_fix", True))) or triage_conf < triage_min_confidence:
+                            triage_unavailable = str(runtime_triage_result.get("root_cause", "")) == "triage_unavailable"
+                            if triage_unavailable:
+                                self._print_key_event(
+                                    "[Run-Triage] unavailable -> fallback to direct fix (ignore confidence gate)",
+                                    bg_code="45"
+                                )
+                            elif (not bool(runtime_triage_result.get("should_fix", True))) or triage_conf < triage_min_confidence:
                                 print(
                                     f"  ⚠ Runtime triage decided to skip fix "
                                     f"(should_fix={bool(runtime_triage_result.get('should_fix', True))}, "
