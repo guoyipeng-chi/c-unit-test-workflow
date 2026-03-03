@@ -1304,6 +1304,9 @@ class LLMUTWorkflow:
                 max_compile_rounds = max_fix_attempts + 2
                 compile_seen_issue_fingerprints = set()
                 runtime_seen_issue_fingerprints = set()
+                compile_consumed_attempts = 0
+                runtime_consumed_attempts = 0
+                runtime_prev_failed_tests = None
                 test_finished = False
 
                 while not test_finished:
@@ -1489,23 +1492,29 @@ class LLMUTWorkflow:
                         triage_result["issue_fingerprint"] = issue_fingerprint
                         triage_result["is_new_issue"] = bool(is_new_issue)
 
-                        if llm_fix_count >= max_fix_attempts:
-                            if is_new_issue:
-                                self._print_key_event(
-                                    "[RetryPolicy] New compile issue after budget -> continue",
-                                    bg_code="42"
-                                )
-                            else:
-                                self._print_key_event(
-                                    "[RetryPolicy] Repeated compile issue after budget -> stop",
-                                    bg_code="41"
-                                )
-                                break
+                        if is_new_issue:
+                            self._print_key_event(
+                                "[RetryPolicy] New compile issue detected -> does not consume attempt budget",
+                                bg_code="42"
+                            )
+                        else:
+                            compile_consumed_attempts += 1
+                            self._print_key_event(
+                                f"[RetryPolicy] Repeated compile issue -> consume budget ({compile_consumed_attempts}/{max_fix_attempts})",
+                                bg_code="43"
+                            )
+
+                        if compile_consumed_attempts > max_fix_attempts:
+                            self._print_key_event(
+                                "[RetryPolicy] Repeated compile issue budget exceeded -> stop",
+                                bg_code="41"
+                            )
+                            break
 
                         compile_seen_issue_fingerprints.add(issue_fingerprint)
 
                         self._print_key_event(
-                            f"[Fix] Compile auto-fix phase ({llm_fix_count + 1}/{max_fix_attempts})",
+                            f"[Fix] Compile auto-fix phase (repeat-budget {compile_consumed_attempts}/{max_fix_attempts}, total-fix {llm_fix_count + 1})",
                             bg_code="46"
                         )
                         try:
@@ -1637,6 +1646,46 @@ class LLMUTWorkflow:
                     if not failed_tests:
                         failed_tests = self._extract_failed_tests_from_output(run_output)
 
+                    current_failed_set = {str(name).strip() for name in failed_tests if str(name).strip()}
+                    if runtime_prev_failed_tests is not None:
+                        resolved = runtime_prev_failed_tests - current_failed_set
+                        if resolved:
+                            runtime_consumed_attempts = 0
+                            runtime_seen_issue_fingerprints.clear()
+                            resolved_preview = ", ".join(sorted(list(resolved))[:4])
+                            if len(resolved) > 4:
+                                resolved_preview += " ..."
+                            self._print_key_event(
+                                f"[RuntimeProgress] {len(resolved)} previously failed case(s) now pass -> reset runtime budget ({resolved_preview})",
+                                bg_code="42"
+                            )
+                    runtime_prev_failed_tests = current_failed_set
+
+                    focus_case = failed_tests[0] if failed_tests else ""
+                    focused_output = ""
+                    focus_xml_summary = {}
+                    if focus_case:
+                        focus_xml_path = os.path.join(
+                            log_dir,
+                            f"{test_name}_focus_attempt{runtime_fix_count}_{timestamp}.xml"
+                        )
+                        try:
+                            focus_result = subprocess.run(
+                                [exe_path, f"--gtest_filter={focus_case}", f"--gtest_output=xml:{focus_xml_path}"],
+                                capture_output=True,
+                                timeout=60,
+                                text=True,
+                                cwd=self.project_dir
+                            )
+                            focused_output = (focus_result.stdout or "") + "\n" + (focus_result.stderr or "")
+                            focus_xml_summary = self._parse_gtest_xml_result(focus_xml_path)
+                            self._print_key_event(
+                                f"[RuntimeFocus] solving case: {focus_case}",
+                                bg_code="45"
+                            )
+                        except Exception as focus_error:
+                            print(f"  ⚠ Focused rerun failed: {focus_error}")
+
                     rerun_summary = self._rerun_failed_tests_for_stability(
                         exe_path=exe_path,
                         failed_tests=failed_tests,
@@ -1645,9 +1694,12 @@ class LLMUTWorkflow:
                         timestamp=timestamp,
                         reruns=2
                     )
-                    mock_violations = self._extract_mock_violations(run_output)
+                    evidence_output = focused_output or run_output
+                    mock_violations = self._extract_mock_violations(evidence_output)
                     runtime_evidence = {
                         "xml_summary": runtime_xml_summary,
+                        "focus_case": focus_case,
+                        "focus_xml_summary": focus_xml_summary,
                         "failed_tests": failed_tests,
                         "stability": rerun_summary,
                         "mock_violations": mock_violations,
@@ -1676,21 +1728,21 @@ class LLMUTWorkflow:
                                 current_test_code = f.read()
 
                             navigation_context = self.compile_analyzer.build_ordered_navigation_context(
-                                compiler_output=run_output,
+                                compiler_output=evidence_output,
                                 key_symbols=[],
                                 max_locations=8
                             )
 
                             runtime_triage_result = self.test_generator.analyze_test_failure(
                                 current_test_code=current_test_code,
-                                test_output=run_output,
+                                test_output=evidence_output,
                                 function_name=test_name.replace("_llm_test", ""),
                                 navigation_context=navigation_context,
                                 runtime_evidence=runtime_evidence
                             )
 
                             enriched_navigation = self.compile_analyzer.build_ordered_navigation_context(
-                                compiler_output=run_output,
+                                compiler_output=evidence_output,
                                 key_symbols=runtime_triage_result.get("key_symbols", []),
                                 max_locations=8
                             )
@@ -1771,32 +1823,38 @@ class LLMUTWorkflow:
                         error_type=str(runtime_triage_result.get("error_type", "unknown")),
                         root_cause=str(runtime_triage_result.get("root_cause", "")),
                         key_symbols=runtime_triage_result.get("key_symbols", []),
-                        raw_output=run_output
+                        raw_output=evidence_output
                     )
                     runtime_is_new_issue = runtime_issue_fingerprint not in runtime_seen_issue_fingerprints
                     runtime_triage_result["issue_fingerprint"] = runtime_issue_fingerprint
                     runtime_triage_result["is_new_issue"] = bool(runtime_is_new_issue)
 
-                    if runtime_fix_count >= max_test_fix_attempts:
-                        if runtime_is_new_issue:
-                            self._print_key_event(
-                                "[RetryPolicy] New runtime issue after budget -> continue",
-                                bg_code="42"
-                            )
-                        else:
-                            self._print_key_event(
-                                "[RetryPolicy] Repeated runtime issue after budget -> stop",
-                                bg_code="41"
-                            )
-                            results.append((test_name, "FAILED"))
-                            all_passed = False
-                            test_finished = True
-                            continue
+                    if runtime_is_new_issue:
+                        self._print_key_event(
+                            "[RetryPolicy] New runtime issue detected -> does not consume attempt budget",
+                            bg_code="42"
+                        )
+                    else:
+                        runtime_consumed_attempts += 1
+                        self._print_key_event(
+                            f"[RetryPolicy] Repeated runtime issue -> consume budget ({runtime_consumed_attempts}/{max_test_fix_attempts})",
+                            bg_code="43"
+                        )
+
+                    if runtime_consumed_attempts > max_test_fix_attempts:
+                        self._print_key_event(
+                            "[RetryPolicy] Repeated runtime issue budget exceeded -> stop",
+                            bg_code="41"
+                        )
+                        results.append((test_name, "FAILED"))
+                        all_passed = False
+                        test_finished = True
+                        continue
 
                     runtime_seen_issue_fingerprints.add(runtime_issue_fingerprint)
 
                     self._print_key_event(
-                        f"[Fix] Runtime auto-fix phase ({runtime_fix_count + 1}/{max_test_fix_attempts})",
+                        f"[Fix] Runtime auto-fix phase (repeat-budget {runtime_consumed_attempts}/{max_test_fix_attempts}, total-fix {runtime_fix_count + 1})",
                         bg_code="46"
                     )
                     try:
