@@ -304,8 +304,7 @@ class LLMUTWorkflow:
             f"[Diff] {phase} auto-fix attempt {attempt} patch preview",
             bg_code="44"
         )
-        for line in (preview or "").splitlines():
-            print(f"    {line}")
+        self._print_diff_preview(preview)
 
         diff_log_path = os.path.join(
             log_dir,
@@ -317,6 +316,25 @@ class LLMUTWorkflow:
 
         print(f"  ↳ Diff patch saved: {diff_log_path}")
         return diff_log_path
+
+    @classmethod
+    def _colorize_diff_line(cls, line: str) -> str:
+        if not cls._ansi_enabled():
+            return line
+        if line.startswith("+++") or line.startswith("---"):
+            return f"\033[90m{line}\033[0m"
+        if line.startswith("@@"):
+            return f"\033[36m{line}\033[0m"
+        if line.startswith("+"):
+            return f"\033[32m{line}\033[0m"
+        if line.startswith("-"):
+            return f"\033[31m{line}\033[0m"
+        return line
+
+    @classmethod
+    def _print_diff_preview(cls, diff_text: str) -> None:
+        for line in (diff_text or "").splitlines():
+            print("    " + cls._colorize_diff_line(line))
 
     @staticmethod
     def _ansi_enabled() -> bool:
@@ -1598,12 +1616,25 @@ class LLMUTWorkflow:
                 same_tu_unmockable_symbols = self._get_same_tu_unmockable_symbols(target_symbol)
 
                 if same_tu_unmockable_symbols:
+                    with open(test_path, 'r', encoding='utf-8') as f:
+                        precheck_before_code = f.read()
                     pre_removed = self._remove_symbol_definitions_from_test_file(
                         test_path=test_path,
                         symbols=same_tu_unmockable_symbols,
                         protected_symbols=[target_symbol]
                     )
                     if pre_removed:
+                        with open(test_path, 'r', encoding='utf-8') as f:
+                            precheck_after_code = f.read()
+                        self._emit_fix_diff(
+                            before_code=precheck_before_code,
+                            after_code=precheck_after_code,
+                            log_dir=log_dir,
+                            test_name=test_name,
+                            phase="precheck",
+                            attempt=1,
+                            timestamp=timestamp
+                        )
                         self._print_key_event(
                             "[PreCheck] Removed same-TU symbol definitions before compile: "
                             + ", ".join(pre_removed[:6])
@@ -1657,12 +1688,25 @@ class LLMUTWorkflow:
 
                         duplicate_symbols = self._extract_duplicate_symbols(compile_output_full)
                         if duplicate_symbols:
+                            with open(test_path, 'r', encoding='utf-8') as f:
+                                detfix_before_code = f.read()
                             removed_symbols = self._remove_symbol_definitions_from_test_file(
                                 test_path=test_path,
                                 symbols=duplicate_symbols,
                                 protected_symbols=[test_name.replace("_llm_test", "")]
                             )
                             if removed_symbols:
+                                with open(test_path, 'r', encoding='utf-8') as f:
+                                    detfix_after_code = f.read()
+                                self._emit_fix_diff(
+                                    before_code=detfix_before_code,
+                                    after_code=detfix_after_code,
+                                    log_dir=log_dir,
+                                    test_name=test_name,
+                                    phase="compile_detfix",
+                                    attempt=compile_round + 1,
+                                    timestamp=timestamp
+                                )
                                 self._print_key_event(
                                     "[DeterministicFix] Removed duplicate symbol definitions: "
                                     + ", ".join(removed_symbols[:6])
@@ -2130,11 +2174,24 @@ class LLMUTWorkflow:
                             if self._c_symbol_to_mock_method_name(sym) in never_called_methods
                         ])
                         if blocked_methods:
+                            with open(test_path, 'r', encoding='utf-8') as f:
+                                runtime_detfix_before_code = f.read()
                             removed_expect_calls = self._remove_expect_call_blocks_for_methods(
                                 test_path=test_path,
                                 method_names=blocked_methods
                             )
                             if removed_expect_calls:
+                                with open(test_path, 'r', encoding='utf-8') as f:
+                                    runtime_detfix_after_code = f.read()
+                                self._emit_fix_diff(
+                                    before_code=runtime_detfix_before_code,
+                                    after_code=runtime_detfix_after_code,
+                                    log_dir=log_dir,
+                                    test_name=test_name,
+                                    phase="runtime_detfix",
+                                    attempt=runtime_fix_count + 1,
+                                    timestamp=timestamp
+                                )
                                 self._print_key_event(
                                     "[DeterministicFix] Removed unreachable EXPECT_CALL blocks: "
                                     + ", ".join(removed_expect_calls),
