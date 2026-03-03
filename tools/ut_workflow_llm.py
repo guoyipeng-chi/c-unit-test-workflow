@@ -1491,6 +1491,13 @@ class LLMUTWorkflow:
                                     )
                                 if triage_result.get("change_direction"):
                                     print(f"  [Direction] {triage_result['change_direction'][0]}")
+                                if triage_result.get("actionable_edits"):
+                                    first_edit = triage_result["actionable_edits"][0]
+                                    print(
+                                        "  [Actionable] "
+                                        f"{first_edit.get('file', '')}:{first_edit.get('line', 1)} -> "
+                                        f"{first_edit.get('instruction', '')}"
+                                    )
 
                                 triage_log_path = os.path.join(
                                     log_dir,
@@ -1617,6 +1624,9 @@ class LLMUTWorkflow:
                                         "summary": str(triage_result.get("minimal_change", "compile fix applied")),
                                         "code_locations": triage_result.get("code_locations", []),
                                         "change_direction": triage_result.get("change_direction", []),
+                                        "analysis_layers": triage_result.get("analysis_layers", []),
+                                        "actionable_edits": triage_result.get("actionable_edits", []),
+                                        "verification_plan": triage_result.get("verification_plan", []),
                                         "change_preview": self._summarize_code_change(before_fix_code, fixed_test_code),
                                         "outcome": "fix_applied_pending_recompile",
                                         "attempt": llm_fix_count + 1
@@ -1857,6 +1867,13 @@ class LLMUTWorkflow:
                                 )
                             if runtime_triage_result.get("change_direction"):
                                 print(f"  [Run-Direction] {runtime_triage_result['change_direction'][0]}")
+                            if runtime_triage_result.get("actionable_edits"):
+                                first_edit = runtime_triage_result["actionable_edits"][0]
+                                print(
+                                    "  [Run-Actionable] "
+                                    f"{first_edit.get('file', '')}:{first_edit.get('line', 1)} -> "
+                                    f"{first_edit.get('instruction', '')}"
+                                )
 
                             triage_log_path = os.path.join(
                                 log_dir,
@@ -1991,6 +2008,9 @@ class LLMUTWorkflow:
                                     "summary": str(runtime_triage_result.get("minimal_change", "runtime fix applied")),
                                     "code_locations": runtime_triage_result.get("code_locations", []),
                                     "change_direction": runtime_triage_result.get("change_direction", []),
+                                    "analysis_layers": runtime_triage_result.get("analysis_layers", []),
+                                    "actionable_edits": runtime_triage_result.get("actionable_edits", []),
+                                    "verification_plan": runtime_triage_result.get("verification_plan", []),
                                     "runtime_evidence": runtime_triage_result.get("runtime_evidence", runtime_evidence),
                                     "change_preview": self._summarize_code_change(before_fix_code, fixed_test_code),
                                     "outcome": "fix_applied_pending_rerun",

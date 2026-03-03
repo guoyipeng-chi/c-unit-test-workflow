@@ -314,6 +314,153 @@ Return ONLY the C++ code, no markdown wrappers."""
         return response
 
     @staticmethod
+    def _is_vague_instruction(text: str) -> bool:
+        if not text:
+            return True
+        lower = text.strip().lower()
+        vague_tokens = [
+            "fix mock",
+            "adjust mock",
+            "fix assertion",
+            "adjust assertion",
+            "update test",
+            "modify code",
+            "improve test",
+            "check mock",
+            "review test"
+        ]
+        return any(tok in lower for tok in vague_tokens) and len(lower) < 60
+
+    @staticmethod
+    def _build_actionable_edits_from_locations(
+        code_locations: List[Dict[str, Any]],
+        fallback_change: str,
+        fallback_type: str
+    ) -> List[Dict[str, Any]]:
+        actionable: List[Dict[str, Any]] = []
+        for loc in code_locations[:4]:
+            file_path = str(loc.get("file", ""))
+            line_no = int(loc.get("line", 1) or 1)
+            symbol = str(loc.get("symbol", "") or loc.get("kind", "target"))
+            reason = str(loc.get("reason", "")).strip()
+            actionable.append({
+                "file": file_path,
+                "line": line_no,
+                "symbol": symbol,
+                "change_type": fallback_type,
+                "instruction": f"At {file_path}:{line_no}, update '{symbol}' with focused change: {fallback_change}",
+                "reason": reason or "location from triage navigation"
+            })
+        return actionable
+
+    def _normalize_triage_result(self,
+                                 result: Dict[str, Any],
+                                 navigation_context: Optional[Dict[str, Any]],
+                                 phase: str) -> Dict[str, Any]:
+        normalized = dict(result or {})
+
+        code_locations = normalized.get("code_locations")
+        if not isinstance(code_locations, list):
+            code_locations = []
+
+        if (not code_locations) and navigation_context:
+            nav_locations = navigation_context.get("code_locations", [])
+            if isinstance(nav_locations, list):
+                code_locations = nav_locations[:6]
+        normalized["code_locations"] = code_locations
+
+        if not isinstance(normalized.get("analysis_layers"), list):
+            normalized["analysis_layers"] = []
+
+        if not normalized["analysis_layers"]:
+            normalized["analysis_layers"] = [
+                {
+                    "layer": "symptom",
+                    "detail": str(normalized.get("error_type", "unknown"))
+                },
+                {
+                    "layer": "mechanism",
+                    "detail": str(normalized.get("root_cause", "triage_unavailable"))
+                },
+                {
+                    "layer": "root_cause",
+                    "detail": str(normalized.get("minimal_change", "apply minimal fix"))
+                }
+            ]
+
+        actionable_edits = normalized.get("actionable_edits")
+        if not isinstance(actionable_edits, list):
+            actionable_edits = []
+
+        fallback_change = str(normalized.get("minimal_change", "apply minimal targeted fix"))
+        fallback_type = "test_logic_update" if phase == "runtime" else "compile_fix"
+
+        if not actionable_edits:
+            actionable_edits = self._build_actionable_edits_from_locations(
+                code_locations=code_locations,
+                fallback_change=fallback_change,
+                fallback_type=fallback_type
+            )
+
+        refined_actionable: List[Dict[str, Any]] = []
+        for edit in actionable_edits:
+            if not isinstance(edit, dict):
+                continue
+            file_path = str(edit.get("file", ""))
+            line_no = int(edit.get("line", 1) or 1)
+            symbol = str(edit.get("symbol", "target"))
+            instruction = str(edit.get("instruction", "")).strip()
+            change_type = str(edit.get("change_type", fallback_type))
+            reason = str(edit.get("reason", "")).strip()
+
+            if self._is_vague_instruction(instruction):
+                instruction = f"At {file_path}:{line_no}, update '{symbol}' with concrete edit: {fallback_change}"
+
+            refined_actionable.append({
+                "file": file_path,
+                "line": line_no,
+                "symbol": symbol,
+                "change_type": change_type,
+                "instruction": instruction,
+                "reason": reason or "triage actionable edit"
+            })
+
+        normalized["actionable_edits"] = refined_actionable[:8]
+
+        verification_plan = normalized.get("verification_plan")
+        if not isinstance(verification_plan, list) or not verification_plan:
+            if phase == "runtime":
+                verification_plan = [
+                    "Rerun focused failed test case first",
+                    "Rerun full test binary and check failure count drops",
+                    "Confirm no new mock contract violations introduced"
+                ]
+            else:
+                verification_plan = [
+                    "Recompile current test target",
+                    "Confirm original compile/link error no longer appears",
+                    "Run binary once to ensure no immediate runtime regression"
+                ]
+        normalized["verification_plan"] = verification_plan
+
+        change_direction = normalized.get("change_direction")
+        if not isinstance(change_direction, list):
+            change_direction = [str(change_direction or "")]
+        concrete_direction = [d for d in change_direction if d and not self._is_vague_instruction(str(d))]
+        if not concrete_direction and refined_actionable:
+            concrete_direction = [refined_actionable[0].get("instruction", fallback_change)]
+        normalized["change_direction"] = concrete_direction[:4]
+
+        fix_strategy = normalized.get("fix_strategy")
+        if not isinstance(fix_strategy, list) or not fix_strategy:
+            fix_strategy = []
+        if (not fix_strategy) and refined_actionable:
+            fix_strategy = [str(edit.get("instruction", "")).strip() for edit in refined_actionable[:4]]
+        normalized["fix_strategy"] = [s for s in fix_strategy if s][:8]
+
+        return normalized
+
+    @staticmethod
     def _remove_function_definitions(code: str, symbol_name: str) -> tuple[str, int]:
         """
         从代码中移除指定符号的函数定义（保留声明）。
@@ -542,7 +689,16 @@ Output schema (all fields required):
     "code_locations": [
         {{"file": "path", "line": 1, "column": 1, "symbol": "name", "reason": "why relevant"}}
     ],
-    "change_direction": ["high-level edit direction"]
+        "change_direction": ["high-level edit direction"],
+        "analysis_layers": [
+            {{"layer": "symptom", "detail": "what failed"}},
+            {{"layer": "mechanism", "detail": "why it failed technically"}},
+            {{"layer": "root_cause", "detail": "final root-cause judgment"}}
+        ],
+        "actionable_edits": [
+            {{"file": "path", "line": 1, "symbol": "target", "change_type": "signature|include|mock|assertion|linkage", "instruction": "exact edit guidance", "reason": "evidence link"}}
+        ],
+        "verification_plan": ["post-fix verification steps"]
 }}
 
 Rules:
@@ -550,6 +706,8 @@ Rules:
 - Prefer minimal edits and preserving test intent
 - code_locations must prioritize provided navigation context and keep original order
 - change_direction should be concise, implementation-oriented (where + what to adjust)
+- analysis_layers must be causally linked (symptom -> mechanism -> root_cause)
+- actionable_edits must be concrete and location-aware, avoid vague text like "fix mock" only
 - Do NOT include markdown, comments, or extra text
 
 Target Function: {function_name}
@@ -594,7 +752,10 @@ Do not introduce file locations outside this scope.
             "key_symbols": [],
             "minimal_change": "apply minimal compile fix",
             "code_locations": [],
-            "change_direction": ["inspect compiler diagnostic location first, then adjust closest signature/include/mock mismatch"]
+            "change_direction": ["inspect compiler diagnostic location first, then adjust closest signature/include/mock mismatch"],
+            "analysis_layers": [],
+            "actionable_edits": [],
+            "verification_plan": []
         }
 
         if not response:
@@ -622,8 +783,7 @@ Do not introduce file locations outside this scope.
             result["code_locations"] = []
         if not isinstance(result.get("change_direction"), list):
             result["change_direction"] = [str(result.get("change_direction", "apply minimal compile fix"))]
-
-        return result
+        return self._normalize_triage_result(result, navigation_context, phase="compile")
 
     def analyze_test_failure(self,
                              current_test_code: str,
@@ -647,7 +807,16 @@ Output schema (all fields required):
     "code_locations": [
         {{"file": "path", "line": 1, "column": 1, "symbol": "name", "reason": "why relevant"}}
     ],
-    "change_direction": ["high-level edit direction"]
+        "change_direction": ["high-level edit direction"],
+        "analysis_layers": [
+            {{"layer": "symptom", "detail": "what failed"}},
+            {{"layer": "mechanism", "detail": "why it failed technically"}},
+            {{"layer": "root_cause", "detail": "final root-cause judgment"}}
+        ],
+        "actionable_edits": [
+            {{"file": "path", "line": 1, "symbol": "target", "change_type": "assertion|expectation|fixture|mock|data", "instruction": "exact edit guidance", "reason": "evidence link"}}
+        ],
+        "verification_plan": ["post-fix verification steps"]
 }}
 
 Rules:
@@ -658,6 +827,8 @@ Rules:
 - change_direction should point to test-side edits only
 - If runtime evidence contains mock contract violations, prioritize the first violation as primary root cause
 - Use stability evidence (stable_failure/flaky/not_reproducible) to adjust confidence
+- analysis_layers must be causally linked (symptom -> mechanism -> root_cause)
+- actionable_edits must be concrete and location-aware, avoid vague text like "fix assertion" only
 - Do NOT include markdown, comments, or extra text
 
 Target Function: {function_name}
@@ -713,7 +884,10 @@ Use this as high-priority evidence. Prefer first_violation for root cause when p
             "key_symbols": [],
             "minimal_change": "apply minimal runtime fix",
             "code_locations": [],
-            "change_direction": ["open failing assertion/expectation location first, then align expected values or mock behavior"]
+            "change_direction": ["open failing assertion/expectation location first, then align expected values or mock behavior"],
+            "analysis_layers": [],
+            "actionable_edits": [],
+            "verification_plan": []
         }
 
         if not response:
@@ -741,8 +915,7 @@ Use this as high-priority evidence. Prefer first_violation for root cause when p
             result["code_locations"] = []
         if not isinstance(result.get("change_direction"), list):
             result["change_direction"] = [str(result.get("change_direction", "apply minimal runtime fix"))]
-
-        return result
+        return self._normalize_triage_result(result, navigation_context, phase="runtime")
 
     def fix_test_from_test_failure(self,
                                    current_test_code: str,
