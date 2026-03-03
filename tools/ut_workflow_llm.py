@@ -13,6 +13,7 @@ import shutil
 import re
 import difflib
 import xml.etree.ElementTree as ET
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -1281,6 +1282,8 @@ class LLMUTWorkflow:
             
             # 准备编译命令
             source_files_for_test = self._resolve_source_files_for_test(test_name, source_files)
+            source_files_active = list(source_files_for_test)
+            full_source_link_mode = False
 
             gtest_link_inputs = self._resolve_gtest_link_inputs(
                 include_dirs,
@@ -1290,7 +1293,7 @@ class LLMUTWorkflow:
             compile_cmd = self._build_compile_command(
                 compiler_path=compiler_path,
                 include_dirs=include_dirs,
-                source_files=source_files_for_test,
+                source_files=source_files_active,
                 test_path=test_path,
                 exe_path=exe_path,
                 gtest_link_inputs=gtest_link_inputs
@@ -1304,6 +1307,8 @@ class LLMUTWorkflow:
                 max_compile_rounds = max_fix_attempts + 2
                 compile_seen_issue_fingerprints = set()
                 runtime_seen_issue_fingerprints = set()
+                compile_issue_counts = defaultdict(int)
+                runtime_issue_counts = defaultdict(int)
                 compile_consumed_attempts = 0
                 runtime_consumed_attempts = 0
                 runtime_prev_failed_tests = None
@@ -1354,6 +1359,31 @@ class LLMUTWorkflow:
                         unresolved_symbols = self._extract_unresolved_symbols(
                             (compile_result.stderr or "") + "\n" + (compile_result.stdout or "")
                         )
+
+                        target_symbol = test_name.replace("_llm_test", "")
+                        if (
+                            unresolved_symbols
+                            and (not full_source_link_mode)
+                            and target_symbol in unresolved_symbols
+                            and len(source_files_active) < len(source_files)
+                        ):
+                            full_source_link_mode = True
+                            source_files_active = list(source_files)
+                            compile_cmd = self._build_compile_command(
+                                compiler_path=compiler_path,
+                                include_dirs=include_dirs,
+                                source_files=source_files_active,
+                                test_path=test_path,
+                                exe_path=exe_path,
+                                gtest_link_inputs=gtest_link_inputs
+                            )
+                            self._print_key_event(
+                                "[Escalation] Target symbol unresolved -> switch to full-source linking",
+                                bg_code="45"
+                            )
+                            compile_round += 1
+                            continue
+
                         if unresolved_symbols:
                             injected_symbols = self._inject_linker_stubs(test_path, unresolved_symbols)
                             if injected_symbols:
@@ -1489,8 +1519,11 @@ class LLMUTWorkflow:
                             raw_output=compile_output
                         )
                         is_new_issue = issue_fingerprint not in compile_seen_issue_fingerprints
+                        compile_issue_counts[issue_fingerprint] += 1
+                        compile_repeat_count = compile_issue_counts[issue_fingerprint]
                         triage_result["issue_fingerprint"] = issue_fingerprint
                         triage_result["is_new_issue"] = bool(is_new_issue)
+                        triage_result["repeat_count"] = int(compile_repeat_count)
 
                         if is_new_issue:
                             self._print_key_event(
@@ -1522,12 +1555,34 @@ class LLMUTWorkflow:
                                 current_test_code = f.read()
                             before_fix_code = current_test_code
 
+                            aggressive_compile_fix = compile_repeat_count >= 2
+                            if aggressive_compile_fix:
+                                self._print_key_event(
+                                    "[Escalation] Compile issue repeated -> aggressive rewrite mode",
+                                    bg_code="45"
+                                )
+
                             fixed_test_code = self.test_generator.fix_test_from_compile_error(
                                 current_test_code=current_test_code,
                                 compile_error=compile_output,
                                 function_name=test_name.replace("_llm_test", ""),
-                                compile_analysis=triage_result if llm_triage_enabled else None
+                                compile_analysis=triage_result if llm_triage_enabled else None,
+                                aggressive=aggressive_compile_fix
                             )
+
+                            first_change_preview = self._summarize_code_change(current_test_code, fixed_test_code)
+                            if first_change_preview == "no_text_change" and not aggressive_compile_fix:
+                                self._print_key_event(
+                                    "[Escalation] No code change detected -> retry once with aggressive rewrite",
+                                    bg_code="45"
+                                )
+                                fixed_test_code = self.test_generator.fix_test_from_compile_error(
+                                    current_test_code=current_test_code,
+                                    compile_error=compile_output,
+                                    function_name=test_name.replace("_llm_test", ""),
+                                    compile_analysis=triage_result if llm_triage_enabled else None,
+                                    aggressive=True
+                                )
 
                             with open(test_path, 'w', encoding='utf-8') as f:
                                 f.write(fixed_test_code)
@@ -1826,8 +1881,11 @@ class LLMUTWorkflow:
                         raw_output=evidence_output
                     )
                     runtime_is_new_issue = runtime_issue_fingerprint not in runtime_seen_issue_fingerprints
+                    runtime_issue_counts[runtime_issue_fingerprint] += 1
+                    runtime_repeat_count = runtime_issue_counts[runtime_issue_fingerprint]
                     runtime_triage_result["issue_fingerprint"] = runtime_issue_fingerprint
                     runtime_triage_result["is_new_issue"] = bool(runtime_is_new_issue)
+                    runtime_triage_result["repeat_count"] = int(runtime_repeat_count)
 
                     if runtime_is_new_issue:
                         self._print_key_event(
@@ -1862,12 +1920,34 @@ class LLMUTWorkflow:
                             current_test_code = f.read()
                         before_fix_code = current_test_code
 
+                        aggressive_runtime_fix = runtime_repeat_count >= 2
+                        if aggressive_runtime_fix:
+                            self._print_key_event(
+                                "[Escalation] Runtime issue repeated -> aggressive rewrite mode",
+                                bg_code="45"
+                            )
+
                         fixed_test_code = self.test_generator.fix_test_from_test_failure(
                             current_test_code=current_test_code,
                             test_output=run_output,
                             function_name=test_name.replace("_llm_test", ""),
-                            failure_analysis=runtime_triage_result if llm_triage_enabled else None
+                            failure_analysis=runtime_triage_result if llm_triage_enabled else None,
+                            aggressive=aggressive_runtime_fix
                         )
+
+                        first_change_preview = self._summarize_code_change(current_test_code, fixed_test_code)
+                        if first_change_preview == "no_text_change" and not aggressive_runtime_fix:
+                            self._print_key_event(
+                                "[Escalation] No code change detected -> retry once with aggressive rewrite",
+                                bg_code="45"
+                            )
+                            fixed_test_code = self.test_generator.fix_test_from_test_failure(
+                                current_test_code=current_test_code,
+                                test_output=run_output,
+                                function_name=test_name.replace("_llm_test", ""),
+                                failure_analysis=runtime_triage_result if llm_triage_enabled else None,
+                                aggressive=True
+                            )
 
                         with open(test_path, 'w', encoding='utf-8') as f:
                             f.write(fixed_test_code)

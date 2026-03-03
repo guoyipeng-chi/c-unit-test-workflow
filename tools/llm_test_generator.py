@@ -395,7 +395,8 @@ Return ONLY the C++ code, no markdown wrappers."""
                                     current_test_code: str,
                                     compile_error: str,
                                     function_name: str = "unknown",
-                                    compile_analysis: Optional[Dict[str, Any]] = None) -> str:
+                                    compile_analysis: Optional[Dict[str, Any]] = None,
+                                    aggressive: bool = False) -> str:
         """
         根据编译错误修复测试代码
 
@@ -419,6 +420,8 @@ Requirements:
 6. Do NOT reference internal/static globals such as g_next_id.
 7. Return ONLY the complete updated C++ test file.
 
+Repair Mode: {"aggressive_rewrite" if aggressive else "targeted_minimal"}
+
 Target Function: {function_name}
 
 === CURRENT TEST CODE ===
@@ -441,6 +444,16 @@ Target Function: {function_name}
 ```
 
 Use this analysis as primary guidance and perform minimal, targeted changes.
+"""
+
+            if aggressive:
+                prompt += """
+
+AGGRESSIVE MODE:
+- Previous fixes likely stagnated.
+- You MUST produce a materially different patch (not a tiny no-op tweak).
+- Prefer a clean, coherent rewrite of the problematic sections while preserving test intent.
+- Do not repeat the same failed approach.
 """
 
             if compile_analysis.get("experience_hints"):
@@ -735,7 +748,8 @@ Use this as high-priority evidence. Prefer first_violation for root cause when p
                                    current_test_code: str,
                                    test_output: str,
                                    function_name: str = "unknown",
-                                   failure_analysis: Optional[Dict[str, Any]] = None) -> str:
+                                   failure_analysis: Optional[Dict[str, Any]] = None,
+                                   aggressive: bool = False) -> str:
         """根据测试运行失败输出修复测试代码（假设被测代码正确）。"""
         prompt = f"""You are an expert C/C++ unit test engineer.
 Fix the following Google Test file based on TEST EXECUTION failures.
@@ -748,6 +762,8 @@ Requirements:
 5. NEVER define/re-implement production C functions in test file.
 6. Preserve exact production signatures from headers.
 7. Return ONLY the complete updated C++ test file.
+
+Repair Mode: {"aggressive_rewrite" if aggressive else "targeted_minimal"}
 
 Target Function: {function_name}
 
@@ -771,6 +787,16 @@ Target Function: {function_name}
 ```
 
 Use this analysis as primary guidance and perform minimal, targeted changes.
+"""
+
+            if aggressive:
+                prompt += """
+
+AGGRESSIVE MODE:
+- Previous fixes likely stagnated.
+- You MUST produce a materially different patch (not a tiny no-op tweak).
+- Prefer rewriting failing assertions/expectations/setup as a coherent block.
+- Do not repeat the same failed approach.
 """
 
             if failure_analysis.get("experience_hints"):
