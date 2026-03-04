@@ -29,6 +29,36 @@
     "output_suffix": "_llm_test.cpp",
     "include_mocks": true,
     "coverage_goal": 80,
+    "execution": {
+      "comment": "可选：自定义测试编译/执行命令模板。留空则使用内置clang/cmake流程",
+      "compile": {
+        "cwd": ".",
+        "command": ""
+      },
+      "run": {
+        "cwd": ".",
+        "command": ""
+      },
+      "placeholders": [
+        "{project_dir}",
+        "{build_dir}",
+        "{test_name}",
+        "{test_path}",
+        "{test_path_q}",
+        "{exe_path}",
+        "{exe_path_q}",
+        "{include_flags}",
+        "{source_files}",
+        "{runtime_xml}",
+        "{runtime_xml_q}",
+        "{gtest_filter}",
+        "{gtest_filter_q}"
+      ],
+      "example_windows": {
+        "compile_command": "cmake --build {build_dir_q} --target {test_name}",
+        "run_command": "{exe_path_q} --gtest_output=xml:{runtime_xml_q}"
+      }
+    },
     "test_cases_per_function": {
       "minimum": 5,
       "recommended": 10

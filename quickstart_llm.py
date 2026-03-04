@@ -747,6 +747,24 @@ Then verify with:
         if effective_experience_store_path:
             cmd.extend(["--experience-store-path", str(effective_experience_store_path)])
 
+        execution_cfg = self.config.get("test_generation", {}).get("execution", {})
+        compile_exec_cfg = execution_cfg.get("compile", {}) if isinstance(execution_cfg, dict) else {}
+        run_exec_cfg = execution_cfg.get("run", {}) if isinstance(execution_cfg, dict) else {}
+
+        compile_template = str(compile_exec_cfg.get("command", "")).strip() if isinstance(compile_exec_cfg, dict) else ""
+        compile_cwd = str(compile_exec_cfg.get("cwd", "")).strip() if isinstance(compile_exec_cfg, dict) else ""
+        run_template = str(run_exec_cfg.get("command", "")).strip() if isinstance(run_exec_cfg, dict) else ""
+        run_cwd = str(run_exec_cfg.get("cwd", "")).strip() if isinstance(run_exec_cfg, dict) else ""
+
+        if compile_template:
+            cmd.extend(["--compile-command-template", compile_template])
+        if compile_cwd:
+            cmd.extend(["--compile-command-cwd", compile_cwd])
+        if run_template:
+            cmd.extend(["--run-command-template", run_template])
+        if run_cwd:
+            cmd.extend(["--run-command-cwd", run_cwd])
+
         # 从配置透传LLM后端与Ollama设置到子进程环境
         env = os.environ.copy()
         llm_cfg = self.config.get("llm", {})

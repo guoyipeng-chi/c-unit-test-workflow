@@ -12,6 +12,7 @@ import subprocess
 import shutil
 import re
 import difflib
+import shlex
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime
@@ -39,7 +40,11 @@ class LLMUTWorkflow:
                  llm_model: Optional[str] = None,
                  experience_store_path: Optional[str] = None,
                  experience_learning_enabled: bool = True,
-                 experience_top_k: int = 3):
+                 experience_top_k: int = 3,
+                 compile_command_template: Optional[str] = None,
+                 compile_command_cwd: Optional[str] = None,
+                 run_command_template: Optional[str] = None,
+                 run_command_cwd: Optional[str] = None):
         """
         初始化工作流
         
@@ -90,10 +95,82 @@ class LLMUTWorkflow:
             "log",
             "function_status_index.json"
         )
+        self.compile_command_template = str(compile_command_template or "").strip() or None
+        self.compile_command_cwd = str(compile_command_cwd or "").strip() or None
+        self.run_command_template = str(run_command_template or "").strip() or None
+        self.run_command_cwd = str(run_command_cwd or "").strip() or None
         if self.experience_learning_enabled:
             exp_path = experience_store_path or os.path.join(self.project_dir, "log", "experience_store.jsonl")
             self.experience_store = ExperienceStore(exp_path)
             print(f"[Memory] Experience store: {exp_path}")
+
+    @staticmethod
+    def _shell_quote(value: str) -> str:
+        if os.name == 'nt':
+            return subprocess.list2cmdline([str(value)])
+        return shlex.quote(str(value))
+
+    def _resolve_custom_cwd(self, cwd_value: Optional[str], fallback: str) -> str:
+        cwd_text = str(cwd_value or "").strip()
+        if not cwd_text:
+            return fallback
+        if os.path.isabs(cwd_text):
+            return cwd_text
+        return os.path.abspath(os.path.join(self.project_dir, cwd_text))
+
+    def _build_command_context(self,
+                               test_name: str,
+                               test_path: str,
+                               exe_path: str,
+                               build_path: str,
+                               include_dirs: Optional[List[str]] = None,
+                               source_files_active: Optional[List[str]] = None,
+                               runtime_xml_path: Optional[str] = None,
+                               gtest_filter: Optional[str] = None) -> Dict[str, str]:
+        include_dirs = include_dirs or []
+        source_files_active = source_files_active or []
+        include_flags = " ".join(include_dirs)
+        source_files = " ".join(source_files_active)
+
+        context = {
+            "project_dir": self.project_dir,
+            "project_dir_q": self._shell_quote(self.project_dir),
+            "build_dir": build_path,
+            "build_dir_q": self._shell_quote(build_path),
+            "test_name": test_name,
+            "test_file": os.path.basename(test_path),
+            "test_path": test_path,
+            "test_path_q": self._shell_quote(test_path),
+            "exe_path": exe_path,
+            "exe_path_q": self._shell_quote(exe_path),
+            "include_flags": include_flags,
+            "source_files": source_files,
+            "runtime_xml": runtime_xml_path or "",
+            "runtime_xml_q": self._shell_quote(runtime_xml_path or ""),
+            "gtest_filter": gtest_filter or "",
+            "gtest_filter_q": self._shell_quote(gtest_filter or ""),
+        }
+        return context
+
+    def _render_command_template(self, template: str, context: Dict[str, str]) -> str:
+        try:
+            return str(template).format(**context)
+        except KeyError as e:
+            missing = str(e).strip("'")
+            raise ValueError(f"Unknown command template placeholder: {missing}")
+
+    def _run_custom_shell_command(self,
+                                  command_text: str,
+                                  cwd: str,
+                                  timeout: int = 120) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            command_text,
+            shell=True,
+            capture_output=True,
+            timeout=timeout,
+            text=True,
+            cwd=cwd
+        )
 
     @staticmethod
     def _default_external_experience_path() -> str:
@@ -227,6 +304,7 @@ class LLMUTWorkflow:
         llm_api_base = llm_config.get('api_base', 'http://localhost:8000')
         llm_model = llm_config.get('model', 'qwen-coder')
         compile_fix_cfg = config.get('test_generation', {}).get('compile_fix', {})
+        exec_cfg = config.get('test_generation', {}).get('execution', {})
         experience_learning_enabled = bool(compile_fix_cfg.get('experience_learning_enabled', True))
         experience_top_k = int(compile_fix_cfg.get('experience_top_k', 3) or 3)
         experience_track_in_git = bool(compile_fix_cfg.get('experience_track_in_git', True))
@@ -264,6 +342,14 @@ class LLMUTWorkflow:
         print(f"[Config] Compile commands: {compile_commands_file}")
         print(f"[Config] Test output dir: {test_output_dir}")
         
+        compile_exec_cfg = exec_cfg.get('compile', {}) if isinstance(exec_cfg, dict) else {}
+        run_exec_cfg = exec_cfg.get('run', {}) if isinstance(exec_cfg, dict) else {}
+
+        compile_template = str(compile_exec_cfg.get('command', '')).strip() if isinstance(compile_exec_cfg, dict) else ''
+        compile_cwd = str(compile_exec_cfg.get('cwd', '')).strip() if isinstance(compile_exec_cfg, dict) else ''
+        run_template = str(run_exec_cfg.get('command', '')).strip() if isinstance(run_exec_cfg, dict) else ''
+        run_cwd = str(run_exec_cfg.get('cwd', '')).strip() if isinstance(run_exec_cfg, dict) else ''
+
         return cls(
             project_dir=project_root,
             compile_commands_file=compile_commands_file,
@@ -274,7 +360,11 @@ class LLMUTWorkflow:
             llm_model=llm_model,
             experience_store_path=str(experience_store_path),
             experience_learning_enabled=experience_learning_enabled,
-            experience_top_k=experience_top_k
+            experience_top_k=experience_top_k,
+            compile_command_template=compile_template,
+            compile_command_cwd=compile_cwd,
+            run_command_template=run_template,
+            run_command_cwd=run_cwd
         )
 
     @staticmethod
@@ -552,7 +642,11 @@ class LLMUTWorkflow:
                                           log_dir: str,
                                           test_name: str,
                                           timestamp: str,
-                                          reruns: int = 2) -> Dict[str, object]:
+                                          reruns: int = 2,
+                                          run_command_template: Optional[str] = None,
+                                          run_command_cwd: Optional[str] = None,
+                                          test_path: Optional[str] = None,
+                                          build_path: Optional[str] = None) -> Dict[str, object]:
         failed_tests = [t for t in failed_tests if t]
         if not failed_tests:
             return {
@@ -572,15 +666,32 @@ class LLMUTWorkflow:
                 log_dir,
                 f"{test_name}_rerun{rerun_index}_{timestamp}.xml"
             )
-            rerun_cmd = [exe_path, f"--gtest_filter={filter_value}", f"--gtest_output=xml:{rerun_xml}"]
-            print(f"  [RunCmd:Rerun#{rerun_index}] {' '.join(rerun_cmd)}")
-            rerun_result = subprocess.run(
-                rerun_cmd,
-                capture_output=True,
-                timeout=60,
-                text=True,
-                cwd=self.project_dir
-            )
+            if run_command_template:
+                rerun_context = self._build_command_context(
+                    test_name=test_name,
+                    test_path=test_path or "",
+                    exe_path=exe_path,
+                    build_path=build_path or self.project_dir,
+                    runtime_xml_path=rerun_xml,
+                    gtest_filter=filter_value
+                )
+                rerun_cmd_text = self._render_command_template(run_command_template, rerun_context)
+                print(f"  [RunCmd:Rerun#{rerun_index}] {rerun_cmd_text}")
+                rerun_result = self._run_custom_shell_command(
+                    rerun_cmd_text,
+                    cwd=run_command_cwd or self.project_dir,
+                    timeout=60
+                )
+            else:
+                rerun_cmd = [exe_path, f"--gtest_filter={filter_value}", f"--gtest_output=xml:{rerun_xml}"]
+                print(f"  [RunCmd:Rerun#{rerun_index}] {' '.join(rerun_cmd)}")
+                rerun_result = subprocess.run(
+                    rerun_cmd,
+                    capture_output=True,
+                    timeout=60,
+                    text=True,
+                    cwd=self.project_dir
+                )
             rerun_output = (rerun_result.stdout or "") + "\n" + (rerun_result.stderr or "")
             rerun_xml_summary = self._parse_gtest_xml_result(rerun_xml)
             rerun_failed = rerun_xml_summary.get("failed_tests", []) or self._extract_failed_tests_from_output(rerun_output)
@@ -1576,7 +1687,11 @@ class LLMUTWorkflow:
                   web_research_enabled: bool = True,
                   web_research_max_results: int = 4,
                   experience_learning_enabled: bool = True,
-                  experience_top_k: int = 3) -> bool:
+                  experience_top_k: int = 3,
+                  compile_command_template: Optional[str] = None,
+                  compile_command_cwd: Optional[str] = None,
+                  run_command_template: Optional[str] = None,
+                  run_command_cwd: Optional[str] = None) -> bool:
         """
         编译并执行生成的测试用例
         
@@ -1618,6 +1733,26 @@ class LLMUTWorkflow:
             print(f"Scoped run for selected functions: {', '.join(target_functions)}")
         
         print(f"Found {len(test_files)} test file(s) to run")
+
+        effective_compile_template = str(
+            compile_command_template if compile_command_template is not None else (self.compile_command_template or "")
+        ).strip()
+        effective_compile_cwd = self._resolve_custom_cwd(
+            compile_command_cwd if compile_command_cwd is not None else self.compile_command_cwd,
+            fallback=self.project_dir
+        )
+        effective_run_template = str(
+            run_command_template if run_command_template is not None else (self.run_command_template or "")
+        ).strip()
+        effective_run_cwd = self._resolve_custom_cwd(
+            run_command_cwd if run_command_cwd is not None else self.run_command_cwd,
+            fallback=self.project_dir
+        )
+
+        if effective_compile_template:
+            print(f"[Build] Using custom compile command template (cwd={effective_compile_cwd})")
+        if effective_run_template:
+            print(f"[Run] Using custom run command template (cwd={effective_run_cwd})")
         
         # 创建编译目录
         build_path = os.path.join(self.project_dir, build_dir)
@@ -1768,14 +1903,35 @@ class LLMUTWorkflow:
                                 f"Compiling after retry {compile_round}/{max_compile_rounds - 1}: {test_name}..."
                             )
 
-                        print(f"  [CompileCmd] {' '.join(compile_cmd)}")
-                        compile_result = subprocess.run(
-                            compile_cmd,
-                            capture_output=True,
-                            timeout=120,
-                            text=True,
-                            cwd=self.project_dir
-                        )
+                        if effective_compile_template:
+                            compile_context = self._build_command_context(
+                                test_name=test_name,
+                                test_path=test_path,
+                                exe_path=exe_path,
+                                build_path=build_path,
+                                include_dirs=include_dirs,
+                                source_files_active=source_files_active,
+                            )
+                            compile_cmd_display = self._render_command_template(
+                                effective_compile_template,
+                                compile_context
+                            )
+                            print(f"  [CompileCmd] {compile_cmd_display}")
+                            compile_result = self._run_custom_shell_command(
+                                compile_cmd_display,
+                                cwd=effective_compile_cwd,
+                                timeout=120
+                            )
+                        else:
+                            compile_cmd_display = ' '.join(compile_cmd)
+                            print(f"  [CompileCmd] {compile_cmd_display}")
+                            compile_result = subprocess.run(
+                                compile_cmd,
+                                capture_output=True,
+                                timeout=120,
+                                text=True,
+                                cwd=self.project_dir
+                            )
 
                         if compile_result.returncode == 0:
                             compile_success = True
@@ -1793,7 +1949,7 @@ class LLMUTWorkflow:
                         compile_log_path = os.path.join(log_dir, f"{test_name}_compile_attempt{compile_round}_{timestamp}.log")
                         with open(compile_log_path, 'w', encoding='utf-8') as log_file:
                             log_file.write("Compile command:\n")
-                            log_file.write(" ".join(compile_cmd) + "\n\n")
+                            log_file.write(compile_cmd_display + "\n\n")
                             log_file.write("STDOUT:\n")
                             log_file.write(compile_result.stdout or "")
                             log_file.write("\nSTDERR:\n")
@@ -2158,15 +2314,35 @@ class LLMUTWorkflow:
                         log_dir,
                         f"{test_name}_run_attempt{runtime_fix_count}_{timestamp}.xml"
                     )
-                    run_cmd = [exe_path, f"--gtest_output=xml:{runtime_xml_path}"]
-                    print(f"  [RunCmd] {' '.join(run_cmd)}")
-                    run_result = subprocess.run(
-                        run_cmd,
-                        capture_output=True,
-                        timeout=60,
-                        text=True,
-                        cwd=self.project_dir
-                    )
+                    if effective_run_template:
+                        run_context = self._build_command_context(
+                            test_name=test_name,
+                            test_path=test_path,
+                            exe_path=exe_path,
+                            build_path=build_path,
+                            runtime_xml_path=runtime_xml_path
+                        )
+                        run_cmd_display = self._render_command_template(
+                            effective_run_template,
+                            run_context
+                        )
+                        print(f"  [RunCmd] {run_cmd_display}")
+                        run_result = self._run_custom_shell_command(
+                            run_cmd_display,
+                            cwd=effective_run_cwd,
+                            timeout=120
+                        )
+                    else:
+                        run_cmd = [exe_path, f"--gtest_output=xml:{runtime_xml_path}"]
+                        run_cmd_display = ' '.join(run_cmd)
+                        print(f"  [RunCmd] {run_cmd_display}")
+                        run_result = subprocess.run(
+                            run_cmd,
+                            capture_output=True,
+                            timeout=120,
+                            text=True,
+                            cwd=self.project_dir
+                        )
 
                     if run_result.returncode == 0:
                         print(f"  ✓ All tests passed")
@@ -2248,15 +2424,35 @@ class LLMUTWorkflow:
                             f"{test_name}_focus_attempt{runtime_fix_count}_{timestamp}.xml"
                         )
                         try:
-                            focus_cmd = [exe_path, f"--gtest_filter={focus_case}", f"--gtest_output=xml:{focus_xml_path}"]
-                            print(f"  [RunCmd:Focus] {' '.join(focus_cmd)}")
-                            focus_result = subprocess.run(
-                                focus_cmd,
-                                capture_output=True,
-                                timeout=60,
-                                text=True,
-                                cwd=self.project_dir
-                            )
+                            if effective_run_template:
+                                focus_context = self._build_command_context(
+                                    test_name=test_name,
+                                    test_path=test_path,
+                                    exe_path=exe_path,
+                                    build_path=build_path,
+                                    runtime_xml_path=focus_xml_path,
+                                    gtest_filter=focus_case
+                                )
+                                focus_cmd_text = self._render_command_template(
+                                    effective_run_template,
+                                    focus_context
+                                )
+                                print(f"  [RunCmd:Focus] {focus_cmd_text}")
+                                focus_result = self._run_custom_shell_command(
+                                    focus_cmd_text,
+                                    cwd=effective_run_cwd,
+                                    timeout=60
+                                )
+                            else:
+                                focus_cmd = [exe_path, f"--gtest_filter={focus_case}", f"--gtest_output=xml:{focus_xml_path}"]
+                                print(f"  [RunCmd:Focus] {' '.join(focus_cmd)}")
+                                focus_result = subprocess.run(
+                                    focus_cmd,
+                                    capture_output=True,
+                                    timeout=60,
+                                    text=True,
+                                    cwd=self.project_dir
+                                )
                             focused_output = (focus_result.stdout or "") + "\n" + (focus_result.stderr or "")
                             focus_xml_summary = self._parse_gtest_xml_result(focus_xml_path)
                             self._print_key_event(
@@ -2272,7 +2468,11 @@ class LLMUTWorkflow:
                         log_dir=log_dir,
                         test_name=test_name,
                         timestamp=timestamp,
-                        reruns=2
+                        reruns=2,
+                        run_command_template=effective_run_template or None,
+                        run_command_cwd=effective_run_cwd,
+                        test_path=test_path,
+                        build_path=build_path
                     )
                     evidence_output = focused_output or run_output
                     mock_violations = self._extract_mock_violations(evidence_output)
@@ -2680,7 +2880,11 @@ Usage:
                           experience_learning_enabled: bool = True,
                           experience_top_k: int = 3,
                           skip_quality_gates: bool = False,
-                          quality_strict: bool = False) -> None:
+                          quality_strict: bool = False,
+                          compile_command_template: Optional[str] = None,
+                          compile_command_cwd: Optional[str] = None,
+                          run_command_template: Optional[str] = None,
+                          run_command_cwd: Optional[str] = None) -> None:
         """
         运行完整工作流
         
@@ -2733,7 +2937,11 @@ Usage:
                 ,web_research_enabled=web_research_enabled,
                 web_research_max_results=web_research_max_results,
                 experience_learning_enabled=experience_learning_enabled,
-                experience_top_k=experience_top_k
+                experience_top_k=experience_top_k,
+                compile_command_template=compile_command_template,
+                compile_command_cwd=compile_command_cwd,
+                run_command_template=run_command_template,
+                run_command_cwd=run_command_cwd
             )
         
         print("\n" + "=" * 60)
@@ -2914,6 +3122,30 @@ def main():
         action="store_true",
         help="Enable strict quality gates (stop workflow when any quality tool reports issues)"
     )
+
+    parser.add_argument(
+        "--compile-command-template",
+        default=None,
+        help="Custom compile command template (shell). Placeholders: {test_path},{exe_path},{build_dir},{project_dir},{include_flags},{source_files}"
+    )
+
+    parser.add_argument(
+        "--compile-command-cwd",
+        default=None,
+        help="Working directory for custom compile command (absolute or relative to project_dir)"
+    )
+
+    parser.add_argument(
+        "--run-command-template",
+        default=None,
+        help="Custom run command template (shell). Placeholders: {exe_path},{runtime_xml},{gtest_filter},{test_name}"
+    )
+
+    parser.add_argument(
+        "--run-command-cwd",
+        default=None,
+        help="Working directory for custom run command (absolute or relative to project_dir)"
+    )
     
     args = parser.parse_args()
 
@@ -2931,6 +3163,10 @@ def main():
     effective_experience_top_k = args.experience_top_k if args.experience_top_k is not None else 3
     effective_experience_store_path = args.experience_store_path
     effective_experience_track_in_git = True
+    effective_compile_command_template = args.compile_command_template
+    effective_compile_command_cwd = args.compile_command_cwd
+    effective_run_command_template = args.run_command_template
+    effective_run_command_cwd = args.run_command_cwd
     
     # 优先从配置文件加载
     if args.config:
@@ -2947,6 +3183,9 @@ def main():
                 cfg = json.load(f)
             quality_cfg = cfg.get('test_generation', {}).get('quality_gates', {})
             compile_fix_cfg = cfg.get('test_generation', {}).get('compile_fix', {})
+            execution_cfg = cfg.get('test_generation', {}).get('execution', {})
+            compile_exec_cfg = execution_cfg.get('compile', {}) if isinstance(execution_cfg, dict) else {}
+            run_exec_cfg = execution_cfg.get('run', {}) if isinstance(execution_cfg, dict) else {}
             if not args.skip_quality_gates and quality_cfg.get('enabled') is False:
                 effective_skip_quality_gates = True
             if not args.quality_strict and quality_cfg.get('strict') is True:
@@ -2999,6 +3238,19 @@ def main():
                         effective_experience_store_path = os.path.abspath(
                             os.path.join(workflow.project_dir, str(cfg_exp_path))
                         )
+
+            if args.compile_command_template is None:
+                value = compile_exec_cfg.get('command', '') if isinstance(compile_exec_cfg, dict) else ''
+                effective_compile_command_template = str(value or '').strip() or None
+            if args.compile_command_cwd is None:
+                value = compile_exec_cfg.get('cwd', '') if isinstance(compile_exec_cfg, dict) else ''
+                effective_compile_command_cwd = str(value or '').strip() or None
+            if args.run_command_template is None:
+                value = run_exec_cfg.get('command', '') if isinstance(run_exec_cfg, dict) else ''
+                effective_run_command_template = str(value or '').strip() or None
+            if args.run_command_cwd is None:
+                value = run_exec_cfg.get('cwd', '') if isinstance(run_exec_cfg, dict) else ''
+                effective_run_command_cwd = str(value or '').strip() or None
         except Exception as e:
             print(f"✗ Failed to load config: {e}")
             sys.exit(1)
@@ -3015,7 +3267,11 @@ def main():
                 project_dir=args.project_dir,
                 compile_commands_file=args.compile_commands,
                 llm_api_base=args.llm_api,
-                llm_model=args.llm_model
+                llm_model=args.llm_model,
+                compile_command_template=effective_compile_command_template,
+                compile_command_cwd=effective_compile_command_cwd,
+                run_command_template=effective_run_command_template,
+                run_command_cwd=effective_run_command_cwd
             )
         except Exception as e:
             print(f"✗ Failed to initialize workflow: {e}")
@@ -3046,7 +3302,11 @@ def main():
             experience_learning_enabled=effective_experience_learning_enabled,
             experience_top_k=max(1, effective_experience_top_k),
             skip_quality_gates=effective_skip_quality_gates,
-            quality_strict=effective_quality_strict
+            quality_strict=effective_quality_strict,
+            compile_command_template=effective_compile_command_template,
+            compile_command_cwd=effective_compile_command_cwd,
+            run_command_template=effective_run_command_template,
+            run_command_cwd=effective_run_command_cwd
         )
 
 
