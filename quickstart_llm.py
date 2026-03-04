@@ -19,10 +19,13 @@ class QuickStart:
     """快速启动助手"""
     
     def __init__(self, project_root: str = "."):
-        self.project_root = Path(project_root).absolute()
-        self.config_file = self.project_root / "llm_workflow_config.json"
-        self.tools_dir = self.project_root / "tools"
+        self.workflow_root = Path(project_root).absolute()
+        self.project_root = self.workflow_root
+        self.config_file = self.workflow_root / "llm_workflow_config.json"
+        self.tools_dir = self.workflow_root / "tools"
         self.config = self._load_config()
+        self._apply_project_root_from_config()
+        self._project_switch_confirmed = False
     
     def _load_config(self) -> dict:
         """加载配置文件"""
@@ -47,6 +50,44 @@ class QuickStart:
                 "model": "qwen-coder"
             }
         }
+
+    def _apply_project_root_from_config(self) -> None:
+        paths_cfg = self.config.get("paths", {}) if isinstance(self.config, dict) else {}
+        configured_root = str(paths_cfg.get("project_root", ".")).strip() if isinstance(paths_cfg, dict) else "."
+        if not configured_root:
+            configured_root = "."
+
+        if os.path.isabs(configured_root):
+            target_root = Path(configured_root)
+        else:
+            target_root = (self.config_file.parent / configured_root).resolve()
+
+        self.project_root = target_root
+
+    def confirm_active_project(self, interactive: bool = False) -> bool:
+        print("\n[Project Context]")
+        print(f"Workflow root : {self.workflow_root}")
+        print(f"Config file   : {self.config_file}")
+        print(f"Target project: {self.project_root}")
+
+        include_dir = self.project_root / self.config.get("paths", {}).get("include_dir", "include")
+        src_dir = self.project_root / self.config.get("paths", {}).get("src_dir", "src")
+        print(f"Include dir   : {include_dir}")
+        print(f"Source dir    : {src_dir}")
+
+        if not self.project_root.exists():
+            print("✗ Target project root does not exist")
+            return False
+
+        switched = self.project_root != self.workflow_root
+        if switched and interactive and not self._project_switch_confirmed:
+            answer = input("Confirm using this switched project root? (y/N): ").strip().lower()
+            if answer not in {"y", "yes"}:
+                print("✗ Project switch not confirmed.")
+                return False
+            self._project_switch_confirmed = True
+
+        return True
 
     @staticmethod
     def _ansi_enabled() -> bool:
@@ -140,6 +181,9 @@ class QuickStart:
 
     def check_environment(self, prompt_install_compiler: bool = False) -> bool:
         """检查环境"""
+        if not self.confirm_active_project(interactive=prompt_install_compiler):
+            return False
+
         print("[Check] Checking environment...")
         print("=" * 60)
         
@@ -380,6 +424,9 @@ class QuickStart:
         return sorted(set(selected))
 
     def select_functions_interactively(self) -> Tuple[Optional[List[str]], bool]:
+        if not self.confirm_active_project(interactive=True):
+            return None, True
+
         records = self._discover_functions_for_selection()
         if not records:
             print("✗ No functions discovered under current include/src paths.")
@@ -621,6 +668,9 @@ Then verify with:
                      experience_top_k: Optional[int] = None,
                      experience_store_path: Optional[str] = None) -> bool:
         """运行工作流"""
+        if not self.confirm_active_project(interactive=False):
+            return False
+
         print("\n[Run] Starting LLM UT Generation Workflow...")
         print("=" * 60)
         
