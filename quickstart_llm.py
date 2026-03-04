@@ -12,7 +12,7 @@ import subprocess
 import shutil
 import re
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 
 class QuickStart:
@@ -269,7 +269,34 @@ class QuickStart:
                 generated.add(stem[:-9])
         return generated
 
-    def _discover_functions_for_selection(self) -> List[Tuple[str, str, bool]]:
+    def _load_function_status_index(self) -> Dict[str, Dict[str, str]]:
+        status_path = self.project_root / "log" / "function_status_index.json"
+        if not status_path.exists():
+            return {}
+        try:
+            with open(status_path, 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+            functions = payload.get("functions", {}) if isinstance(payload, dict) else {}
+            return functions if isinstance(functions, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _normalize_picker_status(raw_status: Optional[str], is_generated: bool) -> str:
+        if not is_generated:
+            return "NEW"
+        status = str(raw_status or "").strip().upper()
+        if status == "PASSED":
+            return "PASS"
+        if status in {"FAILED", "COMPILE_FAILED", "TIMEOUT", "ERROR"}:
+            return "FAIL"
+        return "GEN"
+
+    @staticmethod
+    def _is_failed_picker_status(status: str) -> bool:
+        return str(status or "").upper() == "FAIL"
+
+    def _discover_functions_for_selection(self) -> List[Tuple[str, str, bool, str]]:
         include_dir = self.project_root / self.config.get("paths", {}).get("include_dir", "include")
         src_dir = self.project_root / self.config.get("paths", {}).get("src_dir", "src")
 
@@ -283,11 +310,17 @@ class QuickStart:
         analyzer.analyze_directory()
         funcs = analyzer.get_all_functions()
         generated_names = self._discover_generated_function_names()
+        status_index = self._load_function_status_index()
 
-        records: List[Tuple[str, str, bool]] = []
+        records: List[Tuple[str, str, bool, str]] = []
         for name, dep in funcs.items():
             source = str(dep.source_file).replace('\\', '/')
-            records.append((name, source, name in generated_names))
+            is_generated = name in generated_names
+            raw_status = ""
+            if is_generated:
+                raw_status = str(status_index.get(name, {}).get("status", ""))
+            picker_status = self._normalize_picker_status(raw_status, is_generated)
+            records.append((name, source, is_generated, picker_status))
 
         records.sort(key=lambda item: item[0].lower())
         return records
@@ -355,27 +388,38 @@ class QuickStart:
         page_size = 12
         current_page = 0
         selected_record_indices = set()
-        only_ungenerated = False
-        function_names = [name for name, _, _ in records]
+        filter_mode = "all"  # all | ungenerated | failed
+        function_names = [name for name, _, _, _ in records]
         restore_completion = self._with_function_tab_completion(function_names)
 
         try:
             while True:
                 visible_record_indices = [
-                    i for i, (_, _, is_generated) in enumerate(records)
-                    if (not only_ungenerated) or (not is_generated)
+                    i for i, (_, _, is_generated, picker_status) in enumerate(records)
+                    if (
+                        (filter_mode == "all")
+                        or (filter_mode == "ungenerated" and (not is_generated))
+                        or (filter_mode == "failed" and is_generated and self._is_failed_picker_status(picker_status))
+                    )
                 ]
                 total = len(visible_record_indices)
-                total_generated = sum(1 for _, _, is_generated in records if is_generated)
+                total_generated = sum(1 for _, _, is_generated, _ in records if is_generated)
                 total_new = len(records) - total_generated
+                total_failed = sum(1 for _, _, is_generated, status in records if is_generated and self._is_failed_picker_status(status))
 
                 if total == 0:
                     print("\n[Function Picker]")
-                    print("No functions visible under current filter (only ungenerated).")
-                    print("Commands: u(toggle filter), q(cancel)")
+                    print(f"No functions visible under current filter ({filter_mode}).")
+                    print("Commands: u(ungenerated), f(failed-generated), s(show all), q(cancel)")
                     raw = input("select> ").strip().lower()
-                    if raw in {"u", "ungenerated", "toggle"}:
-                        only_ungenerated = not only_ungenerated
+                    if raw in {"u", "ungenerated"}:
+                        filter_mode = "ungenerated"
+                        continue
+                    if raw in {"f", "failed"}:
+                        filter_mode = "failed"
+                        continue
+                    if raw in {"s", "show", "all"}:
+                        filter_mode = "all"
                         continue
                     if raw in {"q", "quit", "cancel"}:
                         return None, True
@@ -387,21 +431,20 @@ class QuickStart:
                 end = min(total, start + page_size)
 
                 print("\n[Function Picker]")
-                filter_text = "ON" if only_ungenerated else "OFF"
                 print(
                     f"Page {current_page + 1}/{total_pages}, visible: {total}, "
-                    f"all: {len(records)} (new={total_new}, generated={total_generated}), "
-                    f"only-ungenerated: {filter_text}"
+                    f"all: {len(records)} (new={total_new}, generated={total_generated}, failed={total_failed}), "
+                    f"filter: {filter_mode}"
                 )
-                print("Commands: n(next), p(prev), u(toggle ungenerated-only), a(all), d(done), c(clear), q(cancel)")
+                print("Commands: n(next), p(prev), u(ungenerated), f(failed-generated), s(show all), a(all), d(done), c(clear), q(cancel)")
                 print("Input: number(s) like 1 3 8-12, or function name/prefix (Tab to complete)")
                 print("-" * 72)
 
                 for visible_idx in range(start, end):
                     rec_idx = visible_record_indices[visible_idx]
-                    name, src, is_generated = records[rec_idx]
+                    name, src, is_generated, picker_status = records[rec_idx]
                     marker = "*" if rec_idx in selected_record_indices else " "
-                    state = "GEN" if is_generated else "NEW"
+                    state = picker_status
                     row = f"{marker} {visible_idx + 1:>3}. [{state}] {name:<26} {src}"
                     if is_generated:
                         row = self._gray_text(row)
@@ -423,14 +466,22 @@ class QuickStart:
                 if cmd in {"p", "prev"}:
                     current_page = max(current_page - 1, 0)
                     continue
-                if cmd in {"u", "ungenerated", "toggle"}:
-                    only_ungenerated = not only_ungenerated
+                if cmd in {"u", "ungenerated"}:
+                    filter_mode = "ungenerated"
+                    current_page = 0
+                    continue
+                if cmd in {"f", "failed"}:
+                    filter_mode = "failed"
+                    current_page = 0
+                    continue
+                if cmd in {"s", "show", "showall", "allview"}:
+                    filter_mode = "all"
                     current_page = 0
                     continue
                 if cmd in {"a", "all"}:
-                    if only_ungenerated:
+                    if filter_mode != "all":
                         selected = [records[i][0] for i in visible_record_indices]
-                        print(f"✓ Select all visible ungenerated functions ({len(selected)})")
+                        print(f"✓ Select all visible functions ({len(selected)}) under filter '{filter_mode}'")
                         return selected, False
                     print("✓ Select all functions")
                     return None, False
@@ -459,7 +510,7 @@ class QuickStart:
                 name_tokens = [t for t in re.split(r"[\s,]+", raw) if t]
                 matched_any = False
                 for token in name_tokens:
-                    exact = [i for i, (name, _, _) in enumerate(records) if name == token]
+                    exact = [i for i, (name, _, _, _) in enumerate(records) if name == token]
                     if exact:
                         rec_idx = exact[0]
                         if rec_idx in selected_record_indices:
@@ -469,7 +520,7 @@ class QuickStart:
                         matched_any = True
                         continue
 
-                    pref = [i for i, (name, _, _) in enumerate(records) if name.lower().startswith(token.lower())]
+                    pref = [i for i, (name, _, _, _) in enumerate(records) if name.lower().startswith(token.lower())]
                     if len(pref) == 1:
                         rec_idx = pref[0]
                         if rec_idx in selected_record_indices:

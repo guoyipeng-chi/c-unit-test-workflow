@@ -85,6 +85,11 @@ class LLMUTWorkflow:
         self.experience_learning_enabled = bool(experience_learning_enabled)
         self.experience_top_k = max(1, int(experience_top_k or 3))
         self.experience_store = None
+        self.function_status_index_path = os.path.join(
+            self.project_dir,
+            "log",
+            "function_status_index.json"
+        )
         if self.experience_learning_enabled:
             exp_path = experience_store_path or os.path.join(self.project_dir, "log", "experience_store.jsonl")
             self.experience_store = ExperienceStore(exp_path)
@@ -97,6 +102,51 @@ class LLMUTWorkflow:
             base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
             return os.path.join(base, "c-unit-test-workflow", "experience_store.jsonl")
         return os.path.join(os.path.expanduser("~"), ".local", "share", "c-unit-test-workflow", "experience_store.jsonl")
+
+    def _load_function_status_index(self) -> Dict[str, Dict[str, object]]:
+        path = self.function_status_index_path
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+            functions = payload.get("functions", {}) if isinstance(payload, dict) else {}
+            return functions if isinstance(functions, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_function_status_index(self, functions: Dict[str, Dict[str, object]]) -> None:
+        path = self.function_status_index_path
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {
+            "schema": 1,
+            "updated_at": datetime.now().isoformat(),
+            "functions": functions,
+        }
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    def _update_function_status_index(self,
+                                      updates: Dict[str, str],
+                                      log_dir: str,
+                                      timestamp: str) -> None:
+        if not updates:
+            return
+
+        existing = self._load_function_status_index()
+        updated_at = datetime.now().isoformat()
+        for function_name, status in updates.items():
+            if not function_name:
+                continue
+            existing[function_name] = {
+                "status": str(status),
+                "updated_at": updated_at,
+                "test_file": f"{function_name}_llm_test.cpp",
+                "last_timestamp": str(timestamp),
+                "log_dir": str(log_dir).replace('\\', '/')
+            }
+
+        self._save_function_status_index(existing)
     
     @classmethod
     def from_config(cls, config_file: str, 
@@ -523,6 +573,7 @@ class LLMUTWorkflow:
                 f"{test_name}_rerun{rerun_index}_{timestamp}.xml"
             )
             rerun_cmd = [exe_path, f"--gtest_filter={filter_value}", f"--gtest_output=xml:{rerun_xml}"]
+            print(f"  [RunCmd:Rerun#{rerun_index}] {' '.join(rerun_cmd)}")
             rerun_result = subprocess.run(
                 rerun_cmd,
                 capture_output=True,
@@ -1717,6 +1768,7 @@ class LLMUTWorkflow:
                                 f"Compiling after retry {compile_round}/{max_compile_rounds - 1}: {test_name}..."
                             )
 
+                        print(f"  [CompileCmd] {' '.join(compile_cmd)}")
                         compile_result = subprocess.run(
                             compile_cmd,
                             capture_output=True,
@@ -2106,8 +2158,10 @@ class LLMUTWorkflow:
                         log_dir,
                         f"{test_name}_run_attempt{runtime_fix_count}_{timestamp}.xml"
                     )
+                    run_cmd = [exe_path, f"--gtest_output=xml:{runtime_xml_path}"]
+                    print(f"  [RunCmd] {' '.join(run_cmd)}")
                     run_result = subprocess.run(
-                        [exe_path, f"--gtest_output=xml:{runtime_xml_path}"],
+                        run_cmd,
                         capture_output=True,
                         timeout=60,
                         text=True,
@@ -2194,8 +2248,10 @@ class LLMUTWorkflow:
                             f"{test_name}_focus_attempt{runtime_fix_count}_{timestamp}.xml"
                         )
                         try:
+                            focus_cmd = [exe_path, f"--gtest_filter={focus_case}", f"--gtest_output=xml:{focus_xml_path}"]
+                            print(f"  [RunCmd:Focus] {' '.join(focus_cmd)}")
                             focus_result = subprocess.run(
-                                [exe_path, f"--gtest_filter={focus_case}", f"--gtest_output=xml:{focus_xml_path}"],
+                                focus_cmd,
                                 capture_output=True,
                                 timeout=60,
                                 text=True,
@@ -2579,6 +2635,12 @@ class LLMUTWorkflow:
             self._print_key_event("✓ All tests executed successfully", bg_code="42")
         else:
             self._print_key_event("⚠ Some tests failed or couldn't run", bg_code="43")
+
+        status_updates: Dict[str, str] = {}
+        for test_name, status in results:
+            function_name = test_name.replace("_llm_test", "")
+            status_updates[function_name] = status
+        self._update_function_status_index(status_updates, log_dir=log_dir, timestamp=timestamp)
         
         return all_passed
 

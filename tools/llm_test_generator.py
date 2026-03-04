@@ -186,7 +186,11 @@ Return ONLY the C++ test code, no explanations."""
             return self._generate_fallback_test(func_dep)
         
         # 清理响应（移除markdown标记等）
-        test_code = self._clean_response(response)
+        test_code = self._finalize_model_test_code(
+            raw_response=response,
+            fallback_code=self._generate_fallback_test(func_dep),
+            context=f"generate:{func_dep.name}"
+        )
         test_code = self._sanitize_generated_test_code(
             test_code,
             forbidden_symbols=[func_dep.name] + sorted(list(func_dep.external_calls))
@@ -297,6 +301,26 @@ Return ONLY the C++ code, no markdown wrappers."""
     
     def _clean_response(self, response: str) -> str:
         """清理LLM响应"""
+        response = (response or "").strip()
+
+        fenced_blocks = re.findall(
+            r"```(?:cpp|c\+\+|cc|cxx|c)?\s*\n([\s\S]*?)```",
+            response,
+            flags=re.IGNORECASE
+        )
+        if fenced_blocks:
+            def _score(block: str) -> int:
+                score = 0
+                if "#include" in block:
+                    score += 3
+                if re.search(r"\bTEST(?:_F)?\s*\(", block):
+                    score += 3
+                if "extern \"C\"" in block:
+                    score += 1
+                return score
+
+            response = sorted(fenced_blocks, key=_score, reverse=True)[0].strip()
+
         # 移除markdown代码块标记
         if response.startswith("```"):
             lines = response.split('\n')
@@ -312,6 +336,58 @@ Return ONLY the C++ code, no markdown wrappers."""
         response = response.strip()
         
         return response
+
+    @staticmethod
+    def _trim_to_code_region(code: str) -> str:
+        lines = (code or "").splitlines()
+        if not lines:
+            return code
+
+        start_idx = 0
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if (
+                stripped.startswith("#include")
+                or stripped.startswith("extern \"C\"")
+                or stripped.startswith("class ")
+                or stripped.startswith("TEST(")
+                or stripped.startswith("TEST_F(")
+            ):
+                start_idx = idx
+                break
+
+        return "\n".join(lines[start_idx:]).strip()
+
+    @staticmethod
+    def _looks_like_cpp_test_code(code: str) -> bool:
+        if not code:
+            return False
+
+        has_include = "#include" in code
+        has_test_macro = re.search(r"\bTEST(?:_F)?\s*\(", code) is not None
+        has_markdown_fence = "```" in code
+        has_unified_diff = (
+            re.search(r"(?m)^---\s", code) is not None
+            and re.search(r"(?m)^\+\+\+\s", code) is not None
+            and re.search(r"(?m)^@@\s", code) is not None
+        )
+
+        return has_include and has_test_macro and (not has_markdown_fence) and (not has_unified_diff)
+
+    def _finalize_model_test_code(self,
+                                  raw_response: str,
+                                  fallback_code: str,
+                                  context: str) -> str:
+        cleaned = self._clean_response(raw_response)
+        cleaned = self._trim_to_code_region(cleaned)
+
+        if self._looks_like_cpp_test_code(cleaned):
+            return cleaned
+
+        logger.warning(
+            f"Rejected non-code/markdown model output for {context}; keeping fallback/original test code"
+        )
+        return fallback_code
 
     @staticmethod
     def _is_vague_instruction(text: str) -> bool:
@@ -622,7 +698,11 @@ Prefer proven fixes from similar past cases before trying novel changes.
             logger.warning(f"Failed to fix test for {function_name}, keep original code")
             return current_test_code
 
-        fixed_code = self._clean_response(response)
+        fixed_code = self._finalize_model_test_code(
+            raw_response=response,
+            fallback_code=current_test_code,
+            context=f"compile_fix:{function_name}"
+        )
         if not fixed_code.strip():
             logger.warning(f"Empty fixed code for {function_name}, keep original code")
             return current_test_code
@@ -991,7 +1071,11 @@ Prefer proven fixes from similar past cases before trying novel changes.
             logger.warning(f"Failed to fix runtime test for {function_name}, keep original code")
             return current_test_code
 
-        fixed_code = self._clean_response(response)
+        fixed_code = self._finalize_model_test_code(
+            raw_response=response,
+            fallback_code=current_test_code,
+            context=f"runtime_fix:{function_name}"
+        )
         if not fixed_code.strip():
             logger.warning(f"Empty runtime fixed code for {function_name}, keep original code")
             return current_test_code
