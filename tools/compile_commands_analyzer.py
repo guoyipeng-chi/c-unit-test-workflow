@@ -175,8 +175,27 @@ class CompileCommandsAnalyzer:
             return []
 
         results: List[Dict[str, Any]] = []
+        total_files = len(scope_files)
+        show_progress = total_files >= 20
 
-        for source_file in scope_files:
+        def _render_progress(current: int, total: int, stage: str) -> None:
+            if total <= 0:
+                return
+            width = 28
+            ratio = min(1.0, max(0.0, float(current) / float(total)))
+            filled = int(width * ratio)
+            bar = "#" * filled + "-" * (width - filled)
+            percent = int(ratio * 100)
+            print(
+                f"\r[clang-nav] {stage:<10} {current:>4}/{total:<4} [{bar}] {percent:>3}% symbol={symbol}",
+                end="",
+                flush=True
+            )
+
+        for file_index, source_file in enumerate(scope_files, start=1):
+            if show_progress and (file_index == 1 or file_index % 5 == 0 or file_index == total_files):
+                _render_progress(file_index, total_files, "scanning")
+
             info = None
             # compile_info的key可能是相对路径，逐一比对绝对路径
             for compile_info in self.compile_info.values():
@@ -233,6 +252,10 @@ class CompileCommandsAnalyzer:
 
             if len(results) >= max_hits_per_symbol:
                 break
+
+        if show_progress:
+            _render_progress(total_files, total_files, "done")
+            print()
 
         return results
 
