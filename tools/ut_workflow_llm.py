@@ -173,6 +173,18 @@ class LLMUTWorkflow:
         )
 
     @staticmethod
+    def _normalize_command_template(value) -> str:
+        """支持 execution.*.command 为字符串或字符串数组。"""
+        if isinstance(value, str):
+            return value.strip()
+
+        if isinstance(value, (list, tuple)):
+            parts = [str(item).strip() for item in value if str(item).strip()]
+            return " && ".join(parts)
+
+        return str(value or "").strip()
+
+    @staticmethod
     def _default_external_experience_path() -> str:
         """返回仓库外的经验库默认路径（用于不跟Git场景）。"""
         if os.name == 'nt':
@@ -345,9 +357,16 @@ class LLMUTWorkflow:
         compile_exec_cfg = exec_cfg.get('compile', {}) if isinstance(exec_cfg, dict) else {}
         run_exec_cfg = exec_cfg.get('run', {}) if isinstance(exec_cfg, dict) else {}
 
-        compile_template = str(compile_exec_cfg.get('command', '')).strip() if isinstance(compile_exec_cfg, dict) else ''
+        compile_raw = ''
+        run_raw = ''
+        if isinstance(compile_exec_cfg, dict):
+            compile_raw = compile_exec_cfg.get('command', compile_exec_cfg.get('commands', ''))
+        if isinstance(run_exec_cfg, dict):
+            run_raw = run_exec_cfg.get('command', run_exec_cfg.get('commands', ''))
+
+        compile_template = cls._normalize_command_template(compile_raw)
         compile_cwd = str(compile_exec_cfg.get('cwd', '')).strip() if isinstance(compile_exec_cfg, dict) else ''
-        run_template = str(run_exec_cfg.get('command', '')).strip() if isinstance(run_exec_cfg, dict) else ''
+        run_template = cls._normalize_command_template(run_raw)
         run_cwd = str(run_exec_cfg.get('cwd', '')).strip() if isinstance(run_exec_cfg, dict) else ''
 
         return cls(
@@ -1852,16 +1871,16 @@ class LLMUTWorkflow:
         
         print(f"Found {len(test_files)} test file(s) to run")
 
-        effective_compile_template = str(
+        effective_compile_template = self._normalize_command_template(
             compile_command_template if compile_command_template is not None else (self.compile_command_template or "")
-        ).strip()
+        )
         effective_compile_cwd = self._resolve_custom_cwd(
             compile_command_cwd if compile_command_cwd is not None else self.compile_command_cwd,
             fallback=self.project_dir
         )
-        effective_run_template = str(
+        effective_run_template = self._normalize_command_template(
             run_command_template if run_command_template is not None else (self.run_command_template or "")
-        ).strip()
+        )
         effective_run_cwd = self._resolve_custom_cwd(
             run_command_cwd if run_command_cwd is not None else self.run_command_cwd,
             fallback=self.project_dir
@@ -3414,14 +3433,20 @@ def main():
                         )
 
             if args.compile_command_template is None:
-                value = compile_exec_cfg.get('command', '') if isinstance(compile_exec_cfg, dict) else ''
-                effective_compile_command_template = str(value or '').strip() or None
+                value = ''
+                if isinstance(compile_exec_cfg, dict):
+                    value = compile_exec_cfg.get('command', compile_exec_cfg.get('commands', ''))
+                normalized = LLMUTWorkflow._normalize_command_template(value)
+                effective_compile_command_template = normalized or None
             if args.compile_command_cwd is None:
                 value = compile_exec_cfg.get('cwd', '') if isinstance(compile_exec_cfg, dict) else ''
                 effective_compile_command_cwd = str(value or '').strip() or None
             if args.run_command_template is None:
-                value = run_exec_cfg.get('command', '') if isinstance(run_exec_cfg, dict) else ''
-                effective_run_command_template = str(value or '').strip() or None
+                value = ''
+                if isinstance(run_exec_cfg, dict):
+                    value = run_exec_cfg.get('command', run_exec_cfg.get('commands', ''))
+                normalized = LLMUTWorkflow._normalize_command_template(value)
+                effective_run_command_template = normalized or None
             if args.run_command_cwd is None:
                 value = run_exec_cfg.get('cwd', '') if isinstance(run_exec_cfg, dict) else ''
                 effective_run_command_cwd = str(value or '').strip() or None

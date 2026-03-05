@@ -141,6 +141,18 @@ class QuickStart:
             return str(Path(base) / "c-unit-test-workflow" / "experience_store.jsonl")
         return str(Path.home() / ".local" / "share" / "c-unit-test-workflow" / "experience_store.jsonl")
 
+    @staticmethod
+    def _normalize_command_template(value) -> str:
+        """支持 execution.*.command 为字符串或字符串数组。"""
+        if isinstance(value, str):
+            return value.strip()
+
+        if isinstance(value, (list, tuple)):
+            parts = [str(item).strip() for item in value if str(item).strip()]
+            return " && ".join(parts)
+
+        return str(value or "").strip()
+
     def _auto_install_compiler(self) -> bool:
         """自动安装编译器（当前仅Windows支持winget安装LLVM）。"""
         if os.name != 'nt':
@@ -815,9 +827,16 @@ Then verify with:
         compile_exec_cfg = execution_cfg.get("compile", {}) if isinstance(execution_cfg, dict) else {}
         run_exec_cfg = execution_cfg.get("run", {}) if isinstance(execution_cfg, dict) else {}
 
-        compile_template = str(compile_exec_cfg.get("command", "")).strip() if isinstance(compile_exec_cfg, dict) else ""
+        compile_raw = ""
+        run_raw = ""
+        if isinstance(compile_exec_cfg, dict):
+            compile_raw = compile_exec_cfg.get("command", compile_exec_cfg.get("commands", ""))
+        if isinstance(run_exec_cfg, dict):
+            run_raw = run_exec_cfg.get("command", run_exec_cfg.get("commands", ""))
+
+        compile_template = self._normalize_command_template(compile_raw)
         compile_cwd = str(compile_exec_cfg.get("cwd", "")).strip() if isinstance(compile_exec_cfg, dict) else ""
-        run_template = str(run_exec_cfg.get("command", "")).strip() if isinstance(run_exec_cfg, dict) else ""
+        run_template = self._normalize_command_template(run_raw)
         run_cwd = str(run_exec_cfg.get("cwd", "")).strip() if isinstance(run_exec_cfg, dict) else ""
 
         if compile_template:
