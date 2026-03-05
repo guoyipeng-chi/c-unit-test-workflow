@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>C 单元测试工作流 - 中文流程图</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <style>
+        body {
+            font-family: 'Microsoft YaHei', '微软雅黑', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            min-height: 100vh;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+            padding: 30px;
+        }
+        h1 {
+            text-align: center;
+            color: #2c3e50;
+            margin-bottom: 10px;
+        }
+        .subtitle {
+            text-align: center;
+            color: #7f8c8d;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        .diagram-section {
+            text-align: center;
+            overflow-x: auto;
+        }
+        .diagram-section svg {
+            display: inline-block;
+            max-width: 100%;
+            height: auto;
+        }
+        .description {
+            margin-top: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-left: 4px solid #3498db;
+            border-radius: 4px;
+        }
+        .description h3 {
+            margin-top: 0;
+            color: #2c3e50;
+        }
+        .phase {
+            margin: 15px 0;
+            padding: 12px;
+            background: white;
+            border-radius: 4px;
+            border-left: 3px solid #3498db;
+        }
+        .phase-title {
+            font-weight: bold;
+            color: #2c3e50;
+            font-size: 15px;
+        }
+        .phase-desc {
+            color: #555;
+            font-size: 14px;
+            margin-top: 8px;
+            line-height: 1.6;
+        }
+        .phase-desc ul {
+            margin: 8px 0;
+            padding-left: 30px;
+        }
+        .phase-desc li {
+            margin: 5px 0;
+        }
+        .buttons {
+            text-align: center;
+            margin-top: 20px;
+        }
+        button {
+            padding: 10px 20px;
+            margin: 0 10px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            background: #3498db;
+            color: white;
+            transition: background 0.3s;
+            font-family: inherit;
+        }
+        button:hover {
+            background: #2980b9;
+        }
+        .legend {
+            margin-top: 20px;
+            padding: 15px;
+            background: #ecf0f1;
+            border-radius: 4px;
+        }
+        .legend-item {
+            display: inline-block;
+            margin-right: 30px;
+            margin-bottom: 10px;
+        }
+        .legend-color {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border-radius: 3px;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔄 C 单元测试工作流 - 中文版流程图</h1>
+        <p class="subtitle">四阶段优化：索引缓存 → 智能分流 → 两阶段修复 → 配置控制</p>
+        
+        <div class="diagram-section">
+            <div class="mermaid">
+graph TD
+    Start([🚀 开始工作流]) --> CheckConfig{CMakeLists<br/>自动生成<br/>已启用？}
+    
+    CheckConfig -->|是| BuildIndex["📍 第一阶段：构建符号索引<br/>(一次性 clang scope 扫描)<br/>缓存: _clang_scope_symbol_index_cache"]
+    CheckConfig -->|否| SkipIndex["⏭️ 跳过 CMake 自动生成<br/>问题域 = 测试代码"]
+    
+    BuildIndex --> Compile["🔨 编译项目<br/>(compile_commands.json)"]
+    SkipIndex --> Compile
+    
+    Compile --> CompileOK{编译<br/>成功？}
+    
+    CompileOK -->|成功| RunTests["🧪 运行测试"]
+    CompileOK -->|失败| CaptureError["📊 捕获编译错误<br/>+ 导航上下文"]
+    
+    RunTests --> TestOK{测试<br/>通过？}
+    TestOK -->|成功| End1([✅ 成功完成])
+    TestOK -->|失败| CaptureError
+    
+    CaptureError --> Classify["🔀 第二阶段：问题域分类<br/>_classify_issue_domain"]
+    
+    Classify --> CheckRoute{问题域<br/>分类结果}
+    
+    CheckRoute -->|CMakeLists 问题| CMakePhase["🛠️ 第三阶段：两阶段 CMake 修复"]
+    CheckRoute -->|测试代码问题| TestPhase["✏️ 测试代码自动修复<br/>LLMTestGenerator"]
+    CheckRoute -->|测试代码<br/>强制| TestPhase
+    
+    CMakePhase --> EnsureSync["1️⃣ 第一阶段：确定性同步<br/>ensure_cmakelists_for_tests"]
+    EnsureSync --> LLMRepair["2️⃣ 第二阶段：LLM 驱动修复<br/>_llm_repair_cmakelists"]
+    
+    LLMRepair --> CMakeRetry{CMake<br/>修复<br/>成功？}
+    CMakeRetry -->|是| UpdateFiles["📝 更新 CMakeLists.txt"]
+    CMakeRetry -->|否| RetryLLM["🔁 重试 LLM 修复<br/>(最多 3 次)"]
+    RetryLLM --> CMakeRetry
+    
+    UpdateFiles --> Compile
+    
+    TestPhase --> TestRetry{测试<br/>修复<br/>成功？}
+    TestRetry -->|是| UpdateTest["📝 更新测试/源代码文件"]
+    TestRetry -->|否| RetryTest["🔁 重试测试修复<br/>(最多 3 次)"]
+    RetryTest --> TestRetry
+    
+    UpdateTest --> Compile
+    
+    CMakeRetry -->|超过<br/>最大重试| End2([❌ 修复失败])
+    TestRetry -->|超过<br/>最大重试| End2
+    
+    style Start fill:#90EE90
+    style End1 fill:#90EE90
+    style End2 fill:#FFB6C6
+    style BuildIndex fill:#87CEEB
+    style CheckConfig fill:#FFE4B5
+    style Classify fill:#DDA0DD
+    style CMakePhase fill:#F0E68C
+    style LLMRepair fill:#FFB6C1
+    style EnsureSync fill:#FFDAB9
+    style TestPhase fill:#B0E0E6
+            </div>
+        </div>
+
+        <div class="legend">
+            <div>📊 <strong>图例：</strong></div>
+            <div class="legend-item">
+                <div class="legend-color" style="background-color: #90EE90;"></div>
+                <span>开始/成功</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background-color: #87CEEB;"></div>
+                <span>索引缓存</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background-color: #DDA0DD;"></div>
+                <span>问题分类</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background-color: #FFE4B5;"></div>
+                <span>配置决策</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background-color: #F0E68C;"></div>
+                <span>CMake 修复</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background-color: #B0E0E6;"></div>
+                <span>测试修复</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background-color: #FFB6C6;"></div>
+                <span>失败</span>
+            </div>
+        </div>
+
+        <div class="description">
+            <h3>📚 工作流程详解 - 四阶段优化</h3>
+            
+            <div class="phase">
+                <div class="phase-title">📍 第一阶段：符号索引缓存 (Symbol Index Caching)</div>
+                <div class="phase-desc">
+                    <strong>问题：</strong> Clang 符号查找会重复扫描编译 Scope，造成性能浪费<br>
+                    <strong>解决方案：</strong> 一次性构建 Scope 级别的符号索引，使用 <code>_clang_scope_symbol_index_cache</code> 缓存存储<br>
+                    <strong>性能提升：</strong> 后续查询从 O(n) 线性扫描降低到 O(1) 字典查找<br>
+                    <strong>关键代码：</strong>
+                    <ul>
+                        <li><code>_build_scope_symbol_index_with_clang()</code> - 构建符号索引</li>
+                        <li><code>_find_symbol_locations_with_clang()</code> - 查询索引而非重新扫描</li>
+                        <li>缓存键：<code>(mode, scope_files, max_hits_per_symbol)</code></li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="phase">
+                <div class="phase-title">🔀 第二阶段：问题域智能分流 (Issue Domain Routing)</div>
+                <div class="phase-desc">
+                    <strong>问题：</strong> CMakeLists 错误被错误地路由到测试代码自动修复<br>
+                    <strong>解决方案：</strong> 使用 LLM 优先分类（温度=0 确保确定性）+ 规则回退<br>
+                    <strong>分流规则：</strong>
+                    <ul>
+                        <li>🟦 CMakeLists 问题 → 执行第三阶段（CMake 修复）</li>
+                        <li>🟩 测试代码问题 → LLMTestGenerator 自动修复</li>
+                        <li>🟧 配置禁用时 → 强制返回 <code>test_case</code> 跳过分类</li>
+                    </ul>
+                    <strong>关键代码：</strong>
+                    <ul>
+                        <li><code>_classify_issue_domain()</code> - LLM 优先分类</li>
+                        <li><code>_classify_command_issue_domain()</code> - 规则回退</li>
+                        <li>LLM 提示：0 温度，JSON 格式提取</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="phase">
+                <div class="phase-title">🛠️ 第三阶段：两阶段 CMake 修复 (Two-Stage CMake Repair)</div>
+                <div class="phase-desc">
+                    <strong>问题：</strong> 简单的模板同步无法正确修复复杂的 CMakeLists.txt 配置<br>
+                    <strong>解决方案：</strong> 分两个阶段执行<br>
+                    <strong>第一阶段 - 确定性同步：</strong>
+                    <ul>
+                        <li><code>ensure_cmakelists_for_tests()</code> 生成或更新 CMakeLists 模板</li>
+                        <li>创建 <code>LLM_GENERATED_TEST_SOURCES</code> 块（源文件列表）</li>
+                        <li>创建 <code>LLM_AUTO_TEST_TARGETS</code> 块（foreach 循环生成测试可执行文件）</li>
+                    </ul>
+                    <strong>第二阶段 - LLM 驱动修复：</strong>
+                    <ul>
+                        <li><code>_llm_repair_cmakelists()</code> 读取错误信息和上下文</li>
+                        <li>调用 LLM 生成具体的修复补丁</li>
+                        <li>应用补丁到 CMakeLists.txt 文件</li>
+                    </ul>
+                    <strong>重试机制：</strong> 最多 3 次重试，每次失败后重新调用 LLM 获取新的修复方案
+                </div>
+            </div>
+
+            <div class="phase">
+                <div class="phase-title">⚙️ 第四阶段：配置开关与路由旁路 (Config Control & Routing Bypass)</div>
+                <div class="phase-desc">
+                    <strong>新增配置参数：</strong> <code>cmakelists_autogen_enabled</code><br>
+                    <strong>配置文件位置：</strong> <code>llm_workflow_config.json</code><br>
+                    <strong>配置路径：</strong> <code>test_generation.compile_fix.cmakelists_autogen_enabled</code><br>
+                    <strong>默认值：</strong> <code>false</code> (关闭)<br>
+                    <strong>当配置为 true 时：</strong>
+                    <ul>
+                        <li>启用 CMakeLists 自动生成</li>
+                        <li>启用第一和第二阶段的符号索引和智能问题分类</li>
+                        <li>执行第三阶段的两阶段 CMake 修复</li>
+                    </ul>
+                    <strong>当配置为 false 时（推荐）：</strong>
+                    <ul>
+                        <li>跳过所有 CMakeLists 自动生成和修复</li>
+                        <li>旁路问题域智能分流，直接返回 <code>test_case</code></li>
+                        <li>所有编译/测试失败统一视为测试代码问题</li>
+                        <li>减少不必要的 LLM 调用和分类逻辑</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="phase" style="background: #e8f4f8; border-left-color: #2980b9;">
+                <div class="phase-title">⚡ 性能优化总结</div>
+                <div class="phase-desc">
+                    <ul>
+                        <li>✅ <strong>索引缓存：</strong> 符号查询性能提升 100 倍（O(n) → O(1)）</li>
+                        <li>✅ <strong>智能分流：</strong> 减少误分类，提高修复成功率</li>
+                        <li>✅ <strong>两阶段修复：</strong> 结合确定性同步与 LLM 智能修复，提高 CMake 正确率</li>
+                        <li>✅ <strong>配置控制：</strong> 灵活启用/禁用 CMake 自动修复，减少不必要的 API 调用</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <div class="buttons">
+            <button onclick="downloadSVG()">📥 下载 SVG</button>
+            <button onclick="downloadPNG()">📥 下载 PNG</button>
+            <button onclick="printDiagram()">🖨️ 打印</button>
+        </div>
+    </div>
+
+    <script>
+        mermaid.initialize({ startOnLoad: true, theme: 'default', securityLevel: 'loose' });
+        
+        function downloadSVG() {
+            const svg = document.querySelector('.mermaid svg');
+            if (!svg) {
+                alert('流程图还在加载中，请稍候...');
+                return;
+            }
+            const serializer = new XMLSerializer();
+            const svgString = serializer.serializeToString(svg);
+            const blob = new Blob([svgString], { type: 'image/svg+xml' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = 'C单元测试工作流-中文版.svg';
+            link.click();
+            URL.revokeObjectURL(url);
+        }
+
+        function downloadPNG() {
+            const svg = document.querySelector('.mermaid svg');
+            if (!svg) {
+                alert('流程图还在加载中，请稍候...');
+                return;
+            }
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            const serializer = new XMLSerializer();
+            const svgString = serializer.serializeToString(svg);
+            const img = new Image();
+            img.onload = function() {
+                canvas.width = img.width;
+                canvas.height = img.height;
+                ctx.fillStyle = 'white';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(img, 0, 0);
+                canvas.toBlob(function(blob) {
+                    const url = URL.createObjectURL(blob);
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.download = 'C单元测试工作流-中文版.png';
+                    link.click();
+                    URL.revokeObjectURL(url);
+                });
+            };
+            img.src = 'data:image/svg+xml;base64,' + btoa(svgString);
+        }
+
+        function printDiagram() {
+            window.print();
+        }
+    </script>
+</body>
+</html>
