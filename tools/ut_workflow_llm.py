@@ -373,6 +373,13 @@ class LLMUTWorkflow:
         if not text:
             return "unknown"
 
+        if not self.cmakelists_autogen_enabled:
+            self._print_key_event(
+                "[DomainBypass] CMake auto-generation disabled -> force domain=test_case",
+                bg_code="45"
+            )
+            return "test_case"
+
         prompt = f"""You are classifying build/test failure domain for a C/C++ unit-test workflow.
 Return STRICT JSON only:
 {{"domain":"cmakelists|test_case|other","confidence":0.0,"reason":"short"}}
