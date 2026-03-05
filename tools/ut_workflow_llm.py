@@ -851,6 +851,130 @@ class LLMUTWorkflow:
         target_set = {str(name).strip() for name in target_functions if str(name).strip()}
         expected = {f"{name}_llm_test.cpp" for name in target_set}
         return [f for f in all_tests if f in expected]
+
+    @staticmethod
+    def _read_text_file(path: str) -> str:
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read()
+
+    @staticmethod
+    def _write_text_file(path: str, content: str) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+
+    @staticmethod
+    def _normalize_cmake_path(path_text: str) -> str:
+        return str(path_text or "").replace('\\', '/')
+
+    @classmethod
+    def _upsert_marked_block(cls,
+                             content: str,
+                             begin_marker: str,
+                             end_marker: str,
+                             block_body: str) -> str:
+        block = f"{begin_marker}\n{block_body.rstrip()}\n{end_marker}"
+        if begin_marker in content and end_marker in content:
+            pattern = re.compile(
+                rf"{re.escape(begin_marker)}[\\s\\S]*?{re.escape(end_marker)}",
+                re.MULTILINE
+            )
+            return pattern.sub(block, content, count=1)
+
+        if content and not content.endswith('\n'):
+            content += '\n'
+        spacer = "\n" if content.strip() else ""
+        return f"{content}{spacer}{block}\n"
+
+    def _ensure_test_dir_cmakelists(self,
+                                    test_dir: str,
+                                    test_files: List[str]) -> str:
+        """确保测试目录存在可维护的CMakeLists.txt，并同步本轮测试文件列表。"""
+        cmake_path = os.path.join(test_dir, "CMakeLists.txt")
+        rel_files = sorted({os.path.basename(f) for f in test_files if f})
+
+        file_lines = "\n".join([f"  {name}" for name in rel_files]) if rel_files else ""
+        begin = "# >>> LLM AUTO TEST SOURCES BEGIN >>>"
+        end = "# <<< LLM AUTO TEST SOURCES END <<<"
+        block_body = "set(LLM_GENERATED_TEST_SOURCES\n" + file_lines + "\n)"
+
+        if os.path.exists(cmake_path):
+            existing = self._read_text_file(cmake_path)
+            updated = self._upsert_marked_block(existing, begin, end, block_body)
+        else:
+            updated = (
+                "cmake_minimum_required(VERSION 3.16)\n"
+                "project(LLMGeneratedTests LANGUAGES C CXX)\n\n"
+                "enable_testing()\n\n"
+                "# Auto-managed by ut_workflow_llm.py\n"
+                f"{begin}\n{block_body}\n{end}\n"
+            )
+
+        self._write_text_file(cmake_path, updated)
+        return cmake_path
+
+    def _ensure_compile_cwd_cmakelists(self,
+                                       compile_cwd: str,
+                                       test_dir: str,
+                                       test_files: List[str]) -> str:
+        """确保编译工作目录存在CMakeLists.txt并接入测试目录。"""
+        cmake_path = os.path.join(compile_cwd, "CMakeLists.txt")
+        os.makedirs(compile_cwd, exist_ok=True)
+
+        rel_test_dir = os.path.relpath(test_dir, compile_cwd)
+        rel_test_dir = self._normalize_cmake_path(rel_test_dir)
+
+        rel_files = sorted({os.path.basename(f) for f in test_files if f})
+        begin = "# >>> LLM AUTO TEST DIR BEGIN >>>"
+        end = "# <<< LLM AUTO TEST DIR END <<<"
+        files_preview = ", ".join(rel_files[:10])
+        if len(rel_files) > 10:
+            files_preview += f", ... (+{len(rel_files) - 10})"
+        block_body = (
+            f"# test_dir: {rel_test_dir}\n"
+            f"# generated_tests: {files_preview or 'none'}\n"
+            f"if(EXISTS \"${{CMAKE_CURRENT_LIST_DIR}}/{rel_test_dir}/CMakeLists.txt\")\n"
+            f"  add_subdirectory(\"{rel_test_dir}\")\n"
+            "endif()"
+        )
+
+        if os.path.exists(cmake_path):
+            existing = self._read_text_file(cmake_path)
+            updated = self._upsert_marked_block(existing, begin, end, block_body)
+            if "enable_testing()" not in updated:
+                updated = updated.rstrip() + "\n\nenable_testing()\n"
+        else:
+            updated = (
+                "cmake_minimum_required(VERSION 3.16)\n"
+                "project(UTWorkflowHost LANGUAGES C CXX)\n\n"
+                "enable_testing()\n\n"
+                "# Auto-managed by ut_workflow_llm.py\n"
+                f"{begin}\n{block_body}\n{end}\n"
+            )
+
+        self._write_text_file(cmake_path, updated)
+        return cmake_path
+
+    def ensure_cmakelists_for_tests(self,
+                                    test_dir: str,
+                                    compile_cwd: str,
+                                    target_functions: Optional[List[str]] = None) -> Dict[str, str]:
+        """根据当前测试文件，自动创建/补全测试目录与编译目录的 CMakeLists.txt。"""
+        scoped = self._resolve_target_test_files(test_dir, target_functions)
+        test_files = [os.path.join(test_dir, name) for name in scoped]
+
+        test_cmake = self._ensure_test_dir_cmakelists(test_dir, test_files)
+        compile_cmake = self._ensure_compile_cwd_cmakelists(compile_cwd, test_dir, test_files)
+
+        print(f"[CMakeSync] test dir CMakeLists: {test_cmake}")
+        print(f"[CMakeSync] compile cwd CMakeLists: {compile_cmake}")
+        print(f"[CMakeSync] synced test files: {len(test_files)}")
+
+        return {
+            "test_cmakelists": test_cmake,
+            "compile_cmakelists": compile_cmake,
+            "tests": str(len(test_files))
+        }
     
     def verify_tests(self,
                      test_dir: Optional[str] = None,
@@ -1747,6 +1871,15 @@ class LLMUTWorkflow:
             print(f"[Build] Using custom compile command template (cwd={effective_compile_cwd})")
         if effective_run_template:
             print(f"[Run] Using custom run command template (cwd={effective_run_cwd})")
+
+        try:
+            self.ensure_cmakelists_for_tests(
+                test_dir=test_dir,
+                compile_cwd=effective_compile_cwd,
+                target_functions=target_functions
+            )
+        except Exception as cmake_sync_error:
+            print(f"⚠ CMake sync skipped due to error: {cmake_sync_error}")
         
         # 创建编译目录
         build_path = os.path.join(self.project_dir, build_dir)
@@ -2902,6 +3035,20 @@ Usage:
         self.analyze_codebase()
         self.print_compile_info()
         self.generate_tests(target_functions)
+
+        try:
+            pre_compile_cwd = self._resolve_custom_cwd(
+                compile_command_cwd if compile_command_cwd is not None else self.compile_command_cwd,
+                fallback=self.project_dir
+            )
+            self.ensure_cmakelists_for_tests(
+                test_dir=self.test_dir,
+                compile_cwd=pre_compile_cwd,
+                target_functions=target_functions
+            )
+        except Exception as cmake_sync_error:
+            print(f"⚠ CMake sync skipped due to error: {cmake_sync_error}")
+
         verify_ok = self.verify_tests(target_functions=target_functions)
 
         if not verify_ok:
