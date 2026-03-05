@@ -41,6 +41,7 @@ class LLMUTWorkflow:
                  experience_store_path: Optional[str] = None,
                  experience_learning_enabled: bool = True,
                  experience_top_k: int = 3,
+                 cmakelists_autogen_enabled: bool = False,
                  compile_command_template: Optional[str] = None,
                  compile_command_cwd: Optional[str] = None,
                  run_command_template: Optional[str] = None,
@@ -89,6 +90,7 @@ class LLMUTWorkflow:
 
         self.experience_learning_enabled = bool(experience_learning_enabled)
         self.experience_top_k = max(1, int(experience_top_k or 3))
+        self.cmakelists_autogen_enabled = bool(cmakelists_autogen_enabled)
         self.experience_store = None
         self.function_status_index_path = os.path.join(
             self.project_dir,
@@ -203,6 +205,18 @@ class LLMUTWorkflow:
             )
 
             if issue_domain == "cmakelists":
+                if not self.cmakelists_autogen_enabled:
+                    self._print_key_event(
+                        "[CmdAction] CMake auto-generation disabled by config, skip auto-fix",
+                        bg_code="43"
+                    )
+                    return subprocess.CompletedProcess(
+                        args=command_text,
+                        returncode=result.returncode,
+                        stdout="\n".join([s for s in all_stdout if s]),
+                        stderr="\n".join([s for s in all_stderr if s])
+                    )
+
                 self._print_key_event(
                     "[CmdAction] Auto-sync CMakeLists, then LLM-repair if needed",
                     bg_code="45"
@@ -552,6 +566,7 @@ Evidence:
         exec_cfg = config.get('test_generation', {}).get('execution', {})
         experience_learning_enabled = bool(compile_fix_cfg.get('experience_learning_enabled', True))
         experience_top_k = int(compile_fix_cfg.get('experience_top_k', 3) or 3)
+        cmakelists_autogen_enabled = bool(compile_fix_cfg.get('cmakelists_autogen_enabled', False))
         experience_track_in_git = bool(compile_fix_cfg.get('experience_track_in_git', True))
         configured_exp_path = compile_fix_cfg.get('experience_store_path')
 
@@ -586,6 +601,7 @@ Evidence:
         print(f"[Config] Project root: {project_root}")
         print(f"[Config] Compile commands: {compile_commands_file}")
         print(f"[Config] Test output dir: {test_output_dir}")
+        print(f"[Config] CMake auto-generation: {cmakelists_autogen_enabled}")
         
         compile_exec_cfg = exec_cfg.get('compile', {}) if isinstance(exec_cfg, dict) else {}
         run_exec_cfg = exec_cfg.get('run', {}) if isinstance(exec_cfg, dict) else {}
@@ -613,6 +629,7 @@ Evidence:
             experience_store_path=str(experience_store_path),
             experience_learning_enabled=experience_learning_enabled,
             experience_top_k=experience_top_k,
+            cmakelists_autogen_enabled=cmakelists_autogen_enabled,
             compile_command_template=compile_template,
             compile_command_cwd=compile_cwd,
             run_command_template=run_template,
@@ -2233,14 +2250,17 @@ test/CMakeLists.txt current:
         if effective_run_template:
             print(f"[Run] Using custom run command template (cwd={effective_run_cwd})")
 
-        try:
-            self.ensure_cmakelists_for_tests(
-                test_dir=test_dir,
-                compile_cwd=effective_compile_cwd,
-                target_functions=target_functions
-            )
-        except Exception as cmake_sync_error:
-            print(f"⚠ CMake sync skipped due to error: {cmake_sync_error}")
+        if self.cmakelists_autogen_enabled:
+            try:
+                self.ensure_cmakelists_for_tests(
+                    test_dir=test_dir,
+                    compile_cwd=effective_compile_cwd,
+                    target_functions=target_functions
+                )
+            except Exception as cmake_sync_error:
+                print(f"⚠ CMake sync skipped due to error: {cmake_sync_error}")
+        else:
+            print("[CMakeSync] Auto-generation disabled by config")
         
         # 创建编译目录
         build_path = os.path.join(self.project_dir, build_dir)
@@ -2449,6 +2469,13 @@ test/CMakeLists.txt current:
 
                         issue_domain = self._classify_issue_domain(compile_output_full, phase_hint="compile")
                         if issue_domain == "cmakelists":
+                            if not self.cmakelists_autogen_enabled:
+                                self._print_key_event(
+                                    "[CompileRoute] CMake auto-generation disabled by config -> stop compile auto-fix",
+                                    bg_code="43"
+                                )
+                                break
+
                             self._print_key_event(
                                 "[CompileRoute] CMakeLists issue detected -> sync CMake and retry compile",
                                 bg_code="45"
@@ -3424,18 +3451,21 @@ Usage:
         self.print_compile_info()
         self.generate_tests(target_functions)
 
-        try:
-            pre_compile_cwd = self._resolve_custom_cwd(
-                compile_command_cwd if compile_command_cwd is not None else self.compile_command_cwd,
-                fallback=self.project_dir
-            )
-            self.ensure_cmakelists_for_tests(
-                test_dir=self.test_dir,
-                compile_cwd=pre_compile_cwd,
-                target_functions=target_functions
-            )
-        except Exception as cmake_sync_error:
-            print(f"⚠ CMake sync skipped due to error: {cmake_sync_error}")
+        if self.cmakelists_autogen_enabled:
+            try:
+                pre_compile_cwd = self._resolve_custom_cwd(
+                    compile_command_cwd if compile_command_cwd is not None else self.compile_command_cwd,
+                    fallback=self.project_dir
+                )
+                self.ensure_cmakelists_for_tests(
+                    test_dir=self.test_dir,
+                    compile_cwd=pre_compile_cwd,
+                    target_functions=target_functions
+                )
+            except Exception as cmake_sync_error:
+                print(f"⚠ CMake sync skipped due to error: {cmake_sync_error}")
+        else:
+            print("[CMakeSync] Auto-generation disabled by config")
 
         verify_ok = self.verify_tests(target_functions=target_functions)
 
