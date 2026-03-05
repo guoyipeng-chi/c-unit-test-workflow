@@ -728,15 +728,9 @@ class LLMUTWorkflow:
         """分析代码库"""
         self._print_key_node("[Step 1/4] Analyzing C codebase", bg_code="44")
         print("=" * 60)
-        
-        # 分析所有源文件
-        for file in self.code_analyzer._extract_c_files(self.src_dir):
-            self.code_analyzer.analyze_file(file)
-        
-        # 分析所有头文件
-        for file in self.code_analyzer._extract_c_files(self.include_dir):
-            if file.endswith('.h'):
-                self.code_analyzer.analyze_file(file)
+
+        # 统一使用分析器的目录扫描逻辑，避免与quickstart函数选择阶段出现差异
+        self.code_analyzer.analyze_directory()
         
         functions = self.code_analyzer.get_all_functions()
         print(f"✓ Found {len(functions)} functions")
@@ -2955,21 +2949,27 @@ class CCodeAnalyzer:
         # 导入原始分析器
         from c_code_analyzer import CCodeAnalyzer as OrigAnalyzer
         self._analyzer = OrigAnalyzer(include_dir, src_dir)
-        
-        # 复制属性
-        self.__dict__.update(self._analyzer.__dict__)
     
     def _extract_c_files(self, directory: str) -> List[str]:
         """提取目录中的C/H文件"""
         files = []
+        root = Path(directory)
+        if not root.exists():
+            return files
+
         for ext in ['*.c', '*.h']:
-            for file in Path(directory).glob(ext):
-                files.append(str(file))
+            for file in root.rglob(ext):
+                if file.is_file():
+                    files.append(str(file))
         return files
+
+    def analyze_directory(self):
+        """分析目录（委托原始分析器）"""
+        return self._analyzer.analyze_directory()
     
     def get_all_functions(self):
         """获取所有函数"""
-        return self._analyzer.function_map
+        return self._analyzer.get_all_functions()
     
     def analyze_file(self, filepath):
         """分析文件"""
@@ -2996,6 +2996,24 @@ def main():
         "--compile-commands",
         default="build/compile_commands.json",
         help="Path to compile_commands.json (覆盖config中的设置)"
+    )
+
+    parser.add_argument(
+        "--include-dir",
+        default=None,
+        help="Header directory relative to project-dir (覆盖默认include)"
+    )
+
+    parser.add_argument(
+        "--src-dir",
+        default=None,
+        help="Source directory relative to project-dir (覆盖默认src)"
+    )
+
+    parser.add_argument(
+        "--test-output-dir",
+        default=None,
+        help="Test output directory relative to project-dir (覆盖默认test)"
     )
     
     parser.add_argument(
@@ -3178,6 +3196,15 @@ def main():
                 compile_commands_override=args.compile_commands if args.compile_commands != "build/compile_commands.json" else None
             )
 
+            if args.include_dir:
+                workflow.include_dir = os.path.join(workflow.project_dir, args.include_dir)
+            if args.src_dir:
+                workflow.src_dir = os.path.join(workflow.project_dir, args.src_dir)
+            if args.test_output_dir:
+                workflow.test_dir = os.path.join(workflow.project_dir, args.test_output_dir)
+            if args.include_dir or args.src_dir:
+                workflow.code_analyzer = CCodeAnalyzer(workflow.include_dir, workflow.src_dir)
+
             # 从配置读取quality_gates默认值（命令行显式参数优先）
             with open(args.config, 'r', encoding='utf-8') as f:
                 cfg = json.load(f)
@@ -3266,6 +3293,9 @@ def main():
             workflow = LLMUTWorkflow(
                 project_dir=args.project_dir,
                 compile_commands_file=args.compile_commands,
+                test_output_dir=args.test_output_dir,
+                include_dir=args.include_dir,
+                src_dir=args.src_dir,
                 llm_api_base=args.llm_api,
                 llm_model=args.llm_model,
                 compile_command_template=effective_compile_command_template,

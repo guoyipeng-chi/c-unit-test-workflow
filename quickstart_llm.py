@@ -688,6 +688,20 @@ Then verify with:
             "--llm-api", self.config.get("llm", {}).get("api_base", "http://localhost:8000"),
             "--llm-model", self.config.get("llm", {}).get("model", "qwen-coder"),
         ]
+
+        paths_cfg = self.config.get("paths", {}) if isinstance(self.config, dict) else {}
+        include_dir_cfg = str(paths_cfg.get("include_dir", "include")).strip()
+        src_dir_cfg = str(paths_cfg.get("src_dir", "src")).strip()
+        test_output_cfg = str(
+            paths_cfg.get("test_output_dir", paths_cfg.get("test_dir", "test"))
+        ).strip()
+
+        if include_dir_cfg:
+            cmd.extend(["--include-dir", include_dir_cfg])
+        if src_dir_cfg:
+            cmd.extend(["--src-dir", src_dir_cfg])
+        if test_output_cfg:
+            cmd.extend(["--test-output-dir", test_output_cfg])
         
         if analyze_only:
             cmd.append("--analyze-only")
