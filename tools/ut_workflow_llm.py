@@ -17,7 +17,7 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
 # 添加tools目录到路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tools'))
@@ -196,7 +196,7 @@ class LLMUTWorkflow:
                 continue
 
             evidence = (step_stdout + "\n" + step_stderr).strip()
-            issue_domain = self._classify_command_issue_domain(evidence)
+            issue_domain = self._classify_issue_domain(evidence, phase_hint="command_step")
             self._print_key_event(
                 f"[CmdReview] step#{idx} failed, domain={issue_domain}",
                 bg_code="43"
@@ -272,11 +272,17 @@ class LLMUTWorkflow:
         cmake_signals = [
             "cmakelists.txt",
             "cmake error",
+            "cmake error at",
+            "the source directory",
+            "the build directory",
             "does not appear to contain cmakelists.txt",
             "add_subdirectory",
             "unknown cmake command",
             "target not found",
-            "no cmakelists.txt"
+            "no cmakelists.txt",
+            "cannot find source file",
+            "cannot specify link libraries for target",
+            "no sources given to target"
         ]
         if any(signal in text for signal in cmake_signals):
             return "cmakelists"
@@ -287,13 +293,91 @@ class LLMUTWorkflow:
             "gmock",
             "expect_call",
             "assert_",
-            "error:",
-            "failed"
+            "[  failed  ]",
+            "test body",
+            "failure"
         ]
         if any(signal in text for signal in test_case_signals):
             return "test_case"
 
         return "other"
+
+    @staticmethod
+    def _extract_json_object_from_text(raw_text: str) -> Optional[Dict[str, Any]]:
+        text = str(raw_text or "").strip()
+        if not text:
+            return None
+
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                parsed = json.loads(text[start:end + 1])
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                return None
+
+        return None
+
+    def _classify_issue_domain(self, output_text: str, phase_hint: str = "compile") -> str:
+        """先交给LLM分流，失败时回退到规则分流。"""
+        text = str(output_text or "").strip()
+        if not text:
+            return "unknown"
+
+        prompt = f"""You are classifying build/test failure domain for a C/C++ unit-test workflow.
+Return STRICT JSON only:
+{{"domain":"cmakelists|test_case|other","confidence":0.0,"reason":"short"}}
+
+Rules:
+- domain=cmakelists: CMake configuration / target wiring / CMakeLists related failures
+- domain=test_case: generated test code issue (compile/runtime/assert/mock/test logic)
+- domain=other: toolchain/env/dependency or unclear
+- no markdown, no extra text
+
+Phase hint: {phase_hint}
+
+Evidence:
+```
+{text[:8000]}
+```
+"""
+
+        try:
+            response = self.llm_client.generate(
+                prompt,
+                temperature=0.0,
+                max_tokens=120,
+                top_p=0.9
+            )
+            parsed = self._extract_json_object_from_text(response)
+            if isinstance(parsed, dict):
+                domain = str(parsed.get("domain", "")).strip().lower()
+                if domain in {"cmakelists", "test_case", "other"}:
+                    confidence = parsed.get("confidence", "")
+                    reason = str(parsed.get("reason", "")).strip()
+                    self._print_key_event(
+                        f"[DomainLLM] domain={domain}, confidence={confidence}, reason={reason[:80]}",
+                        bg_code="46"
+                    )
+                    return domain
+        except Exception as llm_domain_error:
+            print(f"  ⚠ LLM domain classify failed, fallback to rules: {llm_domain_error}")
+
+        fallback = self._classify_command_issue_domain(text)
+        self._print_key_event(
+            f"[DomainFallback] domain={fallback}",
+            bg_code="45"
+        )
+        return fallback
 
     @staticmethod
     def _normalize_command_template(value) -> str:
@@ -2229,6 +2313,26 @@ class LLMUTWorkflow:
                         print(f"  ↳ Compile log saved: {compile_log_path}")
 
                         compile_output_full = (compile_result.stdout or "") + "\n" + (compile_result.stderr or "")
+
+                        issue_domain = self._classify_issue_domain(compile_output_full, phase_hint="compile")
+                        if issue_domain == "cmakelists":
+                            self._print_key_event(
+                                "[CompileRoute] CMakeLists issue detected -> sync CMake and retry compile",
+                                bg_code="45"
+                            )
+                            try:
+                                self.ensure_cmakelists_for_tests(
+                                    test_dir=test_dir,
+                                    compile_cwd=effective_compile_cwd,
+                                    target_functions=target_functions
+                                )
+                            except Exception as cmake_sync_error:
+                                print(f"  ⚠ CMake sync failed: {cmake_sync_error}")
+                                print("    Skip test-code auto-fix because issue belongs to CMake/project setup")
+                                break
+
+                            compile_round += 1
+                            continue
 
                         duplicate_symbols = self._extract_duplicate_symbols(compile_output_full)
                         if duplicate_symbols:
