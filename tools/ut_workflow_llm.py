@@ -204,7 +204,7 @@ class LLMUTWorkflow:
 
             if issue_domain == "cmakelists":
                 self._print_key_event(
-                    "[CmdAction] Auto-sync CMakeLists and retry current step once",
+                    "[CmdAction] Auto-sync CMakeLists, then LLM-repair if needed",
                     bg_code="45"
                 )
                 try:
@@ -231,7 +231,33 @@ class LLMUTWorkflow:
                             bg_code="42"
                         )
                         continue
-                    result = retry_result
+
+                    retry_evidence = ((retry_result.stdout or "") + "\n" + (retry_result.stderr or "")).strip()
+                    llm_fixed = self._llm_repair_cmakelists(
+                        evidence=retry_evidence,
+                        compile_cwd=cwd,
+                        test_dir=self.test_dir
+                    )
+                    if llm_fixed:
+                        retry2_result = subprocess.run(
+                            step_cmd,
+                            shell=True,
+                            capture_output=True,
+                            timeout=timeout,
+                            text=True,
+                            cwd=cwd
+                        )
+                        all_stdout.append(retry2_result.stdout or "")
+                        all_stderr.append(retry2_result.stderr or "")
+                        if retry2_result.returncode == 0:
+                            self._print_key_event(
+                                f"[CmdAction] step#{idx} recovered after LLM CMake repair",
+                                bg_code="42"
+                            )
+                            continue
+                        result = retry2_result
+                    else:
+                        result = retry_result
                 except Exception as cmake_fix_error:
                     all_stderr.append(f"\n[CMakeSyncError] {cmake_fix_error}\n")
 
@@ -1120,24 +1146,131 @@ Evidence:
         rel_files = sorted({os.path.basename(f) for f in test_files if f})
 
         file_lines = "\n".join([f"  {name}" for name in rel_files]) if rel_files else ""
-        begin = "# >>> LLM AUTO TEST SOURCES BEGIN >>>"
-        end = "# <<< LLM AUTO TEST SOURCES END <<<"
-        block_body = "set(LLM_GENERATED_TEST_SOURCES\n" + file_lines + "\n)"
+        begin_sources = "# >>> LLM AUTO TEST SOURCES BEGIN >>>"
+        end_sources = "# <<< LLM AUTO TEST SOURCES END <<<"
+        block_sources = "set(LLM_GENERATED_TEST_SOURCES\n" + file_lines + "\n)"
+
+        begin_targets = "# >>> LLM AUTO TEST TARGETS BEGIN >>>"
+        end_targets = "# <<< LLM AUTO TEST TARGETS END <<<"
+        block_targets = (
+            "if(LLM_GENERATED_TEST_SOURCES)\n"
+            "  foreach(llm_test_src IN LISTS LLM_GENERATED_TEST_SOURCES)\n"
+            "    get_filename_component(llm_test_name \"${llm_test_src}\" NAME_WE)\n"
+            "    if(TARGET ${llm_test_name})\n"
+            "      continue()\n"
+            "    endif()\n"
+            "\n"
+            "    add_executable(${llm_test_name} ${llm_test_src})\n"
+            "\n"
+            "    if(EXISTS \"${CMAKE_CURRENT_LIST_DIR}/../include\")\n"
+            "      target_include_directories(${llm_test_name} PRIVATE \"${CMAKE_CURRENT_LIST_DIR}/../include\")\n"
+            "    endif()\n"
+            "\n"
+            "    if(TARGET GTest::gtest_main)\n"
+            "      target_link_libraries(${llm_test_name} PRIVATE GTest::gtest_main)\n"
+            "    elseif(TARGET gtest_main)\n"
+            "      target_link_libraries(${llm_test_name} PRIVATE gtest_main)\n"
+            "    elseif(TARGET gtest)\n"
+            "      target_link_libraries(${llm_test_name} PRIVATE gtest)\n"
+            "    endif()\n"
+            "\n"
+            "    add_test(NAME ${llm_test_name} COMMAND ${llm_test_name})\n"
+            "  endforeach()\n"
+            "endif()"
+        )
 
         if os.path.exists(cmake_path):
             existing = self._read_text_file(cmake_path)
-            updated = self._upsert_marked_block(existing, begin, end, block_body)
+            updated = self._upsert_marked_block(existing, begin_sources, end_sources, block_sources)
+            updated = self._upsert_marked_block(updated, begin_targets, end_targets, block_targets)
+            if "enable_testing()" not in updated:
+                updated = updated.rstrip() + "\n\nenable_testing()\n"
         else:
             updated = (
                 "cmake_minimum_required(VERSION 3.16)\n"
                 "project(LLMGeneratedTests LANGUAGES C CXX)\n\n"
                 "enable_testing()\n\n"
                 "# Auto-managed by ut_workflow_llm.py\n"
-                f"{begin}\n{block_body}\n{end}\n"
+                f"{begin_sources}\n{block_sources}\n{end_sources}\n\n"
+                f"{begin_targets}\n{block_targets}\n{end_targets}\n"
             )
 
         self._write_text_file(cmake_path, updated)
         return cmake_path
+
+    def _llm_repair_cmakelists(self,
+                               evidence: str,
+                               compile_cwd: str,
+                               test_dir: str) -> bool:
+        """使用LLM对两个CMakeLists做定向修复，成功返回True。"""
+        compile_cmake = os.path.join(compile_cwd, "CMakeLists.txt")
+        test_cmake = os.path.join(test_dir, "CMakeLists.txt")
+
+        compile_text = self._read_text_file(compile_cmake) if os.path.exists(compile_cmake) else ""
+        test_text = self._read_text_file(test_cmake) if os.path.exists(test_cmake) else ""
+
+        prompt = f"""You are fixing CMakeLists files for a C/C++ test workflow.
+Return STRICT JSON only:
+{{
+  "changed": true,
+  "reason": "short",
+  "compile_cmakelists": "full file content",
+  "test_cmakelists": "full file content"
+}}
+
+Rules:
+- Keep existing user content unless required to fix the reported error.
+- Preserve the managed marker blocks if present.
+- Ensure test CMakeLists can build generated *_llm_test.cpp and register tests.
+- Do not output markdown.
+
+Error evidence:
+```
+{str(evidence or '')[:10000]}
+```
+
+compile_cwd/CMakeLists.txt current:
+```cmake
+{compile_text[:12000]}
+```
+
+test/CMakeLists.txt current:
+```cmake
+{test_text[:12000]}
+```
+"""
+
+        try:
+            response = self.llm_client.generate(
+                prompt,
+                temperature=0.0,
+                max_tokens=2500,
+                top_p=0.9
+            )
+            parsed = self._extract_json_object_from_text(response)
+            if not isinstance(parsed, dict):
+                return False
+
+            new_compile = str(parsed.get("compile_cmakelists", "")).strip()
+            new_test = str(parsed.get("test_cmakelists", "")).strip()
+            changed = bool(parsed.get("changed", False))
+
+            if (not changed) or (not new_compile) or (not new_test):
+                return False
+
+            if new_compile != compile_text:
+                self._write_text_file(compile_cmake, new_compile + "\n")
+            if new_test != test_text:
+                self._write_text_file(test_cmake, new_test + "\n")
+
+            self._print_key_event(
+                f"[CMakeLLMFix] Applied LLM CMake repair: {str(parsed.get('reason', ''))[:80]}",
+                bg_code="46"
+            )
+            return True
+        except Exception as cmake_llm_error:
+            print(f"  ⚠ LLM CMake repair failed: {cmake_llm_error}")
+            return False
 
     def _ensure_compile_cwd_cmakelists(self,
                                        compile_cwd: str,
@@ -2325,6 +2458,11 @@ Evidence:
                                     test_dir=test_dir,
                                     compile_cwd=effective_compile_cwd,
                                     target_functions=target_functions
+                                )
+                                self._llm_repair_cmakelists(
+                                    evidence=compile_output_full,
+                                    compile_cwd=effective_compile_cwd,
+                                    test_dir=test_dir
                                 )
                             except Exception as cmake_sync_error:
                                 print(f"  ⚠ CMake sync failed: {cmake_sync_error}")
