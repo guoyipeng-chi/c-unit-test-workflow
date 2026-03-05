@@ -53,6 +53,9 @@ class CompileCommandsAnalyzer:
         self.commands: List[Dict] = []
         self.compile_info: Dict[str, CompileInfo] = {}
         self.project_root = os.path.dirname(compile_commands_file)
+        self._symbol_location_cache: Dict[Any, List[Dict[str, Any]]] = {}
+        self._navigation_context_cache: Dict[Any, Dict[str, Any]] = {}
+        self._clang_scope_symbol_index_cache: Dict[Any, Dict[str, List[Dict[str, Any]]]] = {}
         
         # 初始化libclang（如果可用）
         self.clang_index = None
@@ -66,6 +69,148 @@ class CompileCommandsAnalyzer:
                 self.use_clang = False
         
         self._load_commands()
+
+    @staticmethod
+    def _normalize_symbols(symbols: Optional[List[str]]) -> List[str]:
+        cleaned: List[str] = []
+        seen = set()
+        for sym in (symbols or []):
+            name = str(sym or "").strip()
+            if not name:
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            cleaned.append(name)
+        return cleaned
+
+    @staticmethod
+    def _normalize_text_fingerprint(text: str, max_len: int = 800) -> str:
+        value = re.sub(r'\s+', ' ', str(text or '').strip())
+        if len(value) <= max_len:
+            return value
+        return value[:max_len]
+
+    def _build_compile_info_lookup(self, scope_files: List[str]) -> Dict[str, CompileInfo]:
+        """构建绝对路径到CompileInfo的快速映射。"""
+        scope_set = set(scope_files)
+        lookup: Dict[str, CompileInfo] = {}
+        for compile_info in self.compile_info.values():
+            abs_file = self._to_abs_path(compile_info.file, compile_info.directory)
+            if abs_file and abs_file in scope_set and abs_file not in lookup:
+                lookup[abs_file] = compile_info
+        return lookup
+
+    def _build_scope_symbol_index_with_clang(self,
+                                             scope_files: List[str],
+                                             max_hits_per_symbol: int = 8) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        基于compile scope一次性构建符号索引。
+        构建后，任意symbol查询都走内存索引，避免逐symbol重复扫描。
+        """
+        if (not self.use_clang) or (not self.clang_index):
+            return {}
+
+        hit_cap = max(1, int(max_hits_per_symbol or 8))
+        cache_key = (
+            "clang_scope_index",
+            tuple(scope_files),
+            int(hit_cap)
+        )
+        cached = self._clang_scope_symbol_index_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        scope_set = set(scope_files)
+        info_lookup = self._build_compile_info_lookup(scope_files)
+        symbol_index: Dict[str, List[Dict[str, Any]]] = {}
+        total_files = len(scope_files)
+        show_progress = total_files >= 20
+
+        def _render_progress(current: int, total: int, stage: str) -> None:
+            if total <= 0:
+                return
+            width = 28
+            ratio = min(1.0, max(0.0, float(current) / float(total)))
+            filled = int(width * ratio)
+            bar = "#" * filled + "-" * (width - filled)
+            percent = int(ratio * 100)
+            print(
+                f"\r[clang-nav] {stage:<10} {current:>4}/{total:<4} [{bar}] {percent:>3}% scope-index",
+                end="",
+                flush=True
+            )
+
+        for file_index, source_file in enumerate(scope_files, start=1):
+            if show_progress and (file_index == 1 or file_index % 5 == 0 or file_index == total_files):
+                _render_progress(file_index, total_files, "indexing")
+
+            info = info_lookup.get(source_file)
+            if not info:
+                continue
+
+            args: List[str] = []
+            for inc_dir in info.include_dirs:
+                args.append(f"-I{inc_dir}")
+            for name, value in info.defines.items():
+                if value:
+                    args.append(f"-D{name}={value}")
+                else:
+                    args.append(f"-D{name}")
+            if info.c_standard:
+                args.append(f"-std={info.c_standard}")
+
+            try:
+                tu = self.clang_index.parse(source_file, args=args)
+            except Exception:
+                continue
+
+            for cursor in tu.cursor.walk_preorder():
+                spelling = (cursor.spelling or "").strip()
+                if (not spelling) or len(spelling) > 128:
+                    continue
+
+                location = cursor.location
+                if not location or not location.file:
+                    continue
+
+                loc_file_abs = self._to_abs_path(str(location.file.name))
+                if loc_file_abs not in scope_set:
+                    continue
+
+                is_definition = bool(getattr(cursor, "is_definition", lambda: False)())
+                kind = "symbol_definition" if is_definition else "symbol_declaration"
+                symbol_entries = symbol_index.setdefault(spelling, [])
+                if len(symbol_entries) >= hit_cap:
+                    continue
+
+                line_no = int(location.line or 1)
+                col_no = int(location.column or 1)
+                duplicate = any(
+                    entry.get("file") == self._relativize(loc_file_abs, self.project_root)
+                    and int(entry.get("line", 0)) == line_no
+                    and int(entry.get("column", 0)) == col_no
+                    and entry.get("kind") == kind
+                    for entry in symbol_entries
+                )
+                if duplicate:
+                    continue
+
+                symbol_entries.append({
+                    "kind": kind,
+                    "symbol": spelling,
+                    "file": self._relativize(loc_file_abs, self.project_root),
+                    "line": line_no,
+                    "column": col_no,
+                    "reason": "clang scope index"
+                })
+
+        if show_progress:
+            _render_progress(total_files, total_files, "done")
+            print()
+
+        self._clang_scope_symbol_index_cache[cache_key] = symbol_index
+        return symbol_index
     
     def _load_commands(self) -> None:
         """从JSON文件加载编译命令"""
@@ -174,88 +319,23 @@ class CompileCommandsAnalyzer:
         if (not symbol) or (not self.use_clang) or (not self.clang_index):
             return []
 
-        results: List[Dict[str, Any]] = []
-        total_files = len(scope_files)
-        show_progress = total_files >= 20
+        cache_key = (
+            "clang",
+            symbol,
+            int(max_hits_per_symbol or 2),
+            tuple(scope_files)
+        )
+        cached = self._symbol_location_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
 
-        def _render_progress(current: int, total: int, stage: str) -> None:
-            if total <= 0:
-                return
-            width = 28
-            ratio = min(1.0, max(0.0, float(current) / float(total)))
-            filled = int(width * ratio)
-            bar = "#" * filled + "-" * (width - filled)
-            percent = int(ratio * 100)
-            print(
-                f"\r[clang-nav] {stage:<10} {current:>4}/{total:<4} [{bar}] {percent:>3}% symbol={symbol}",
-                end="",
-                flush=True
-            )
+        scope_index = self._build_scope_symbol_index_with_clang(
+            scope_files=scope_files,
+            max_hits_per_symbol=max(8, int(max_hits_per_symbol or 2))
+        )
+        results = list(scope_index.get(symbol, []))[:max_hits_per_symbol]
 
-        for file_index, source_file in enumerate(scope_files, start=1):
-            if show_progress and (file_index == 1 or file_index % 5 == 0 or file_index == total_files):
-                _render_progress(file_index, total_files, "scanning")
-
-            info = None
-            # compile_info的key可能是相对路径，逐一比对绝对路径
-            for compile_info in self.compile_info.values():
-                compile_file_abs = self._to_abs_path(compile_info.file, compile_info.directory)
-                if compile_file_abs == source_file:
-                    info = compile_info
-                    break
-
-            if not info:
-                continue
-
-            args: List[str] = []
-            for inc_dir in info.include_dirs:
-                args.append(f"-I{inc_dir}")
-            for name, value in info.defines.items():
-                if value:
-                    args.append(f"-D{name}={value}")
-                else:
-                    args.append(f"-D{name}")
-            if info.c_standard:
-                args.append(f"-std={info.c_standard}")
-
-            try:
-                tu = self.clang_index.parse(source_file, args=args)
-            except Exception:
-                continue
-
-            found_for_file = 0
-            for cursor in tu.cursor.walk_preorder():
-                spelling = (cursor.spelling or "").strip()
-                if spelling != symbol:
-                    continue
-
-                location = cursor.location
-                if not location or not location.file:
-                    continue
-
-                loc_file_abs = self._to_abs_path(str(location.file.name))
-                if loc_file_abs not in scope_files:
-                    continue
-
-                is_definition = bool(getattr(cursor, "is_definition", lambda: False)())
-                results.append({
-                    "kind": "symbol_definition" if is_definition else "symbol_declaration",
-                    "symbol": symbol,
-                    "file": self._relativize(loc_file_abs, self.project_root),
-                    "line": int(location.line or 1),
-                    "column": int(location.column or 1),
-                    "reason": "clang navigation in compile_commands scope"
-                })
-                found_for_file += 1
-                if found_for_file >= max_hits_per_symbol:
-                    break
-
-            if len(results) >= max_hits_per_symbol:
-                break
-
-        if show_progress:
-            _render_progress(total_files, total_files, "done")
-            print()
+        self._symbol_location_cache[cache_key] = list(results)
 
         return results
 
@@ -266,6 +346,16 @@ class CompileCommandsAnalyzer:
         """在clang不可用时，按compile scope做有限正则定位。"""
         if not symbol:
             return []
+
+        cache_key = (
+            "fallback",
+            symbol,
+            int(max_hits_per_symbol or 2),
+            tuple(scope_files)
+        )
+        cached = self._symbol_location_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
 
         results: List[Dict[str, Any]] = []
         pattern = re.compile(rf'\b{re.escape(symbol)}\b')
@@ -287,9 +377,12 @@ class CompileCommandsAnalyzer:
                                 "reason": "fallback scoped regex location"
                             })
                             if len(results) >= max_hits_per_symbol:
+                                self._symbol_location_cache[cache_key] = list(results)
                                 return results
             except Exception:
                 continue
+
+        self._symbol_location_cache[cache_key] = list(results)
 
         return results
 
@@ -302,11 +395,22 @@ class CompileCommandsAnalyzer:
         1) 先诊断点
         2) 再符号声明/定义点（优先clang）
         """
-        key_symbols = [s for s in (key_symbols or []) if isinstance(s, str) and s.strip()]
+        key_symbols = self._normalize_symbols(key_symbols)
         max_locations = max(1, int(max_locations or 8))
 
         scope_list = self.get_compile_scope_files()
         scope_set = set(scope_list)
+
+        navigation_cache_key = (
+            self._normalize_text_fingerprint(compiler_output),
+            tuple(key_symbols[:6]),
+            int(max_locations),
+            tuple(scope_list),
+            bool(self.use_clang and self.clang_index)
+        )
+        cached_navigation = self._navigation_context_cache.get(navigation_cache_key)
+        if cached_navigation is not None:
+            return dict(cached_navigation)
 
         locations: List[Dict[str, Any]] = []
         locations.extend(self._extract_error_locations(compiler_output, scope_set, max_hits=max_locations))
@@ -355,7 +459,7 @@ class CompileCommandsAnalyzer:
                 "reason": loc.get("reason", "")
             })
 
-        return {
+        result = {
             "scope": {
                 "source": "compile_commands.json",
                 "total_files": len(scope_list),
@@ -364,6 +468,9 @@ class CompileCommandsAnalyzer:
             "code_locations": locations[:max_locations],
             "ordered_navigation": ordered_navigation[:max_locations]
         }
+
+        self._navigation_context_cache[navigation_cache_key] = dict(result)
+        return result
     
     def extract_all_includes(self, source_file: str, compile_info: Optional[CompileInfo] = None) -> Set[str]:
         """
