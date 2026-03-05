@@ -99,6 +99,7 @@ class LLMUTWorkflow:
         self.compile_command_cwd = str(compile_command_cwd or "").strip() or None
         self.run_command_template = str(run_command_template or "").strip() or None
         self.run_command_cwd = str(run_command_cwd or "").strip() or None
+        self._current_target_functions_for_cmake_sync: Optional[List[str]] = None
         if self.experience_learning_enabled:
             exp_path = experience_store_path or os.path.join(self.project_dir, "log", "experience_store.jsonl")
             self.experience_store = ExperienceStore(exp_path)
@@ -163,14 +164,136 @@ class LLMUTWorkflow:
                                   command_text: str,
                                   cwd: str,
                                   timeout: int = 120) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            command_text,
-            shell=True,
-            capture_output=True,
-            timeout=timeout,
-            text=True,
-            cwd=cwd
+        command_steps = self._split_command_steps(command_text)
+        if not command_steps:
+            return subprocess.CompletedProcess(
+                args=command_text,
+                returncode=0,
+                stdout="",
+                stderr=""
+            )
+
+        all_stdout: List[str] = []
+        all_stderr: List[str] = []
+
+        for idx, step_cmd in enumerate(command_steps, 1):
+            print(f"  [CmdStep {idx}/{len(command_steps)}] {step_cmd}")
+            result = subprocess.run(
+                step_cmd,
+                shell=True,
+                capture_output=True,
+                timeout=timeout,
+                text=True,
+                cwd=cwd
+            )
+
+            step_stdout = result.stdout or ""
+            step_stderr = result.stderr or ""
+            all_stdout.append(step_stdout)
+            all_stderr.append(step_stderr)
+
+            if result.returncode == 0:
+                continue
+
+            evidence = (step_stdout + "\n" + step_stderr).strip()
+            issue_domain = self._classify_command_issue_domain(evidence)
+            self._print_key_event(
+                f"[CmdReview] step#{idx} failed, domain={issue_domain}",
+                bg_code="43"
+            )
+
+            if issue_domain == "cmakelists":
+                self._print_key_event(
+                    "[CmdAction] Auto-sync CMakeLists and retry current step once",
+                    bg_code="45"
+                )
+                try:
+                    self.ensure_cmakelists_for_tests(
+                        test_dir=self.test_dir,
+                        compile_cwd=cwd,
+                        target_functions=self._current_target_functions_for_cmake_sync
+                    )
+                    retry_result = subprocess.run(
+                        step_cmd,
+                        shell=True,
+                        capture_output=True,
+                        timeout=timeout,
+                        text=True,
+                        cwd=cwd
+                    )
+                    retry_stdout = retry_result.stdout or ""
+                    retry_stderr = retry_result.stderr or ""
+                    all_stdout.append(retry_stdout)
+                    all_stderr.append(retry_stderr)
+                    if retry_result.returncode == 0:
+                        self._print_key_event(
+                            f"[CmdAction] step#{idx} recovered after CMake sync",
+                            bg_code="42"
+                        )
+                        continue
+                    result = retry_result
+                except Exception as cmake_fix_error:
+                    all_stderr.append(f"\n[CMakeSyncError] {cmake_fix_error}\n")
+
+            if issue_domain == "test_case":
+                self._print_key_event(
+                    "[CmdAction] Test-case issue detected -> hand over to existing compile/runtime fix loop",
+                    bg_code="45"
+                )
+
+            return subprocess.CompletedProcess(
+                args=command_text,
+                returncode=result.returncode,
+                stdout="\n".join([s for s in all_stdout if s]),
+                stderr="\n".join([s for s in all_stderr if s])
+            )
+
+        return subprocess.CompletedProcess(
+            args=command_text,
+            returncode=0,
+            stdout="\n".join([s for s in all_stdout if s]),
+            stderr="\n".join([s for s in all_stderr if s])
         )
+
+    @staticmethod
+    def _split_command_steps(command_text: str) -> List[str]:
+        text = str(command_text or "").strip()
+        if not text:
+            return []
+        steps = [part.strip() for part in re.split(r"\s*&&\s*", text) if part.strip()]
+        return steps or [text]
+
+    @staticmethod
+    def _classify_command_issue_domain(output_text: str) -> str:
+        text = str(output_text or "").lower()
+        if not text:
+            return "unknown"
+
+        cmake_signals = [
+            "cmakelists.txt",
+            "cmake error",
+            "does not appear to contain cmakelists.txt",
+            "add_subdirectory",
+            "unknown cmake command",
+            "target not found",
+            "no cmakelists.txt"
+        ]
+        if any(signal in text for signal in cmake_signals):
+            return "cmakelists"
+
+        test_case_signals = [
+            "_llm_test.cpp",
+            "gtest",
+            "gmock",
+            "expect_call",
+            "assert_",
+            "error:",
+            "failed"
+        ]
+        if any(signal in text for signal in test_case_signals):
+            return "test_case"
+
+        return "other"
 
     @staticmethod
     def _normalize_command_template(value) -> str:
@@ -1864,10 +1987,12 @@ class LLMUTWorkflow:
         
         if not test_files:
             print("✗ No test files found to run!")
+            self._current_target_functions_for_cmake_sync = None
             return False
 
         if target_functions:
             print(f"Scoped run for selected functions: {', '.join(target_functions)}")
+        self._current_target_functions_for_cmake_sync = list(target_functions or [])
         
         print(f"Found {len(test_files)} test file(s) to run")
 
@@ -1939,6 +2064,7 @@ class LLMUTWorkflow:
         if not compiler_path:
             print("✗ No C++ compiler found (expected one of: g++, clang++, cl)")
             print("  Please install a compiler or run from a Developer Command Prompt.")
+            self._current_target_functions_for_cmake_sync = None
             return False
         print(f"[Build] Using compiler: {compiler_path}")
         
@@ -2987,6 +3113,7 @@ class LLMUTWorkflow:
             function_name = test_name.replace("_llm_test", "")
             status_updates[function_name] = status
         self._update_function_status_index(status_updates, log_dir=log_dir, timestamp=timestamp)
+        self._current_target_functions_for_cmake_sync = None
         
         return all_passed
 
