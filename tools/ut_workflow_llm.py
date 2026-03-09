@@ -1850,6 +1850,74 @@ test/CMakeLists.txt current:
 
         return diagnostics
 
+    @staticmethod
+    def _print_clang_diagnostics_table(test_path: str,
+                                       diagnostics: List[str],
+                                       max_rows: int = 12) -> None:
+        """格式化打印clang诊断表格，便于快速查看错误分布。"""
+        total = len(diagnostics)
+        print(
+            f"[PreCompileCheck] Clang diagnostics summary: file={Path(test_path).name}, total_errors={total}"
+        )
+        if total <= 0:
+            return
+
+        display_rows = diagnostics[:max_rows]
+        headers = ["#", "Line", "Col", "Severity", "Message"]
+        widths = [4, 7, 7, 10, 92]
+
+        def _truncate(value: str, limit: int) -> str:
+            text = str(value or "")
+            text = re.sub(r"\s+", " ", text).strip()
+            if len(text) <= limit:
+                return text
+            if limit <= 1:
+                return text[:limit]
+            return text[:limit - 1] + "…"
+
+        def _render_sep() -> str:
+            return "+" + "+".join(["-" * w for w in widths]) + "+"
+
+        def _render_row(cells: List[str]) -> str:
+            padded = [
+                _truncate(cells[idx], widths[idx] - 2).ljust(widths[idx] - 2)
+                for idx in range(len(widths))
+            ]
+            return "| " + " | ".join(padded) + " |"
+
+        print(_render_sep())
+        print(_render_row(headers))
+        print(_render_sep())
+
+        for idx, raw in enumerate(display_rows, 1):
+            line_no = "?"
+            col_no = "?"
+            severity = "error"
+            message = raw
+
+            m = re.match(
+                r"^(.+?):(\d+):(\d+):\s*(fatal error|error|warning|note):\s*(.*)$",
+                str(raw).strip(),
+                flags=re.IGNORECASE
+            )
+            if m:
+                line_no = m.group(2)
+                col_no = m.group(3)
+                severity = m.group(4).lower()
+                message = m.group(5)
+
+            print(_render_row([
+                str(idx),
+                str(line_no),
+                str(col_no),
+                severity,
+                message,
+            ]))
+
+        print(_render_sep())
+        if total > max_rows:
+            print(f"[PreCompileCheck] ... {total - max_rows} more error(s) not shown")
+
     def _preclean_test_file_with_clang(self,
                                        test_path: str,
                                        test_name: str,
@@ -1880,6 +1948,7 @@ test/CMakeLists.txt current:
                 "[PreCompileCheck] clang diagnostics found but auto-fix disabled",
                 bg_code="43"
             )
+            self._print_clang_diagnostics_table(test_path, diagnostics)
             return False
 
         attempts = max(1, int(max_attempts or 1))
@@ -1901,10 +1970,7 @@ test/CMakeLists.txt current:
                 f"[PreCompileCheck] Found {len(diagnostics)} clang error(s), auto-fix attempt {attempt}/{attempts}",
                 bg_code="45"
             )
-            for line in diagnostics[:5]:
-                print(f"  [clang] {line}")
-            if len(diagnostics) > 5:
-                print("  [clang] ... (more diagnostics)")
+            self._print_clang_diagnostics_table(test_path, diagnostics)
 
             clang_error_text = "\n".join(diagnostics)
             with open(test_path, 'r', encoding='utf-8') as f:
@@ -1982,6 +2048,7 @@ test/CMakeLists.txt current:
                 f"[PreCompileCheck] Remaining clang errors after pre-fix: {len(remaining)}",
                 bg_code="43"
             )
+            self._print_clang_diagnostics_table(test_path, remaining)
             return False
         return True
 
