@@ -1806,7 +1806,19 @@ test/CMakeLists.txt current:
                                                   include_dirs: List[str],
                                                   define_flags: List[str],
                                                   cxx_standard: str) -> List[str]:
-        """使用libclang收集测试文件级错误诊断（模拟编辑器红波浪线错误）。"""
+        """
+        收集测试文件级错误诊断。
+        优先使用 clangd --check（与 VS Code clangd 同源），失败时回退到 libclang。
+        """
+        clangd_diagnostics = self._collect_clangd_error_diagnostics_for_test(test_path)
+        if clangd_diagnostics:
+            return clangd_diagnostics
+
+        self._print_key_event(
+            "[PreCompileCheck] clangd diagnostics unavailable -> fallback to libclang",
+            bg_code="45"
+        )
+
         if not getattr(self.compile_analyzer, 'use_clang', False):
             return []
 
@@ -1847,6 +1859,91 @@ test/CMakeLists.txt current:
             col = int(getattr(loc, 'column', 1) or 1)
             message = str(getattr(diag, 'spelling', '') or '').strip()
             diagnostics.append(f"{test_abs}:{line}:{col}: error: {message}")
+
+        return diagnostics
+
+    def _collect_clangd_error_diagnostics_for_test(self, test_path: str) -> List[str]:
+        """使用 clangd --check 获取诊断，尽量与 VS Code 中 clangd 的诊断来源一致。"""
+        clangd_path = self._find_tool("clangd")
+        if not clangd_path:
+            return []
+
+        test_abs = os.path.abspath(test_path)
+        compile_db = os.path.dirname(os.path.abspath(getattr(self.compile_analyzer, 'file', '') or self.project_dir))
+
+        cmd = [
+            clangd_path,
+            f"--check={test_abs}",
+            f"--compile-commands-dir={compile_db}",
+            "--log=error",
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=self.project_dir,
+                timeout=30
+            )
+        except Exception as clangd_error:
+            self._print_key_event(
+                f"[PreCompileCheck] clangd --check failed: {clangd_error}",
+                bg_code="43"
+            )
+            return []
+
+        combined = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+        if not combined:
+            return []
+
+        diagnostics: List[str] = []
+        seen = set()
+        patterns = [
+            re.compile(
+                r"^(?P<file>[A-Za-z]:\\[^:\n]+|/[^:\n]+):(?P<line>\d+):(?P<col>\d+):\s*(?P<sev>fatal error|error|warning|note):\s*(?P<msg>.+)$",
+                flags=re.IGNORECASE
+            ),
+            re.compile(
+                r"^(?P<file>[^:\n]+):(?P<line>\d+):(?P<col>\d+):\s*(?P<sev>fatal error|error|warning|note):\s*(?P<msg>.+)$",
+                flags=re.IGNORECASE
+            )
+        ]
+
+        for raw_line in combined.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            matched = None
+            for pattern in patterns:
+                m = pattern.match(line)
+                if m:
+                    matched = m
+                    break
+            if not matched:
+                continue
+
+            sev = str(matched.group("sev") or "").lower()
+            if sev not in {"error", "fatal error"}:
+                continue
+
+            file_text = str(matched.group("file") or "").strip().strip('"')
+            file_abs = os.path.abspath(file_text)
+            if file_abs != test_abs:
+                continue
+
+            diag_text = f"{file_abs}:{matched.group('line')}:{matched.group('col')}: error: {matched.group('msg').strip()}"
+            if diag_text in seen:
+                continue
+            seen.add(diag_text)
+            diagnostics.append(diag_text)
+
+        if diagnostics:
+            self._print_key_event(
+                f"[PreCompileCheck] diagnostics source=clangd --check ({len(diagnostics)} errors)",
+                bg_code="46"
+            )
 
         return diagnostics
 
@@ -2368,6 +2465,7 @@ test/CMakeLists.txt current:
         if os.name == 'nt':
             common_paths = {
                 "clang++": ["C:/Program Files/LLVM/bin/clang++.exe"],
+                "clangd": ["C:/Program Files/LLVM/bin/clangd.exe"],
                 "clang-format": ["C:/Program Files/LLVM/bin/clang-format.exe"],
                 "clang-tidy": ["C:/Program Files/LLVM/bin/clang-tidy.exe"],
                 "cppcheck": [
