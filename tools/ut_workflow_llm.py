@@ -17,7 +17,7 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 
 # 添加tools目录到路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tools'))
@@ -1748,6 +1748,243 @@ test/CMakeLists.txt current:
                     symbols.append(symbol)
         return symbols
 
+    def _collect_compile_flags_from_scope(self) -> Tuple[List[str], List[str], str]:
+        """从compile_commands作用域收集 include/define/C++标准，供诊断预检查复用。"""
+        include_dirs = ["-I" + self.include_dir]
+        define_flags: List[str] = []
+        cxx_standard = "c++14"
+
+        seen_inc = set(include_dirs)
+        seen_def = set()
+
+        if hasattr(self.compile_analyzer, 'compile_info'):
+            for _, compile_info in self.compile_analyzer.compile_info.items():
+                include_list = []
+                define_map: Dict[str, Optional[str]] = {}
+                cxx_std = ""
+
+                if hasattr(compile_info, 'include_dirs'):
+                    include_list = list(getattr(compile_info, 'include_dirs', []) or [])
+                elif isinstance(compile_info, dict):
+                    include_list = list(compile_info.get('includes') or compile_info.get('include_dirs', []) or [])
+
+                if hasattr(compile_info, 'defines'):
+                    define_map = dict(getattr(compile_info, 'defines', {}) or {})
+                elif isinstance(compile_info, dict):
+                    define_map = dict(compile_info.get('defines') or {})
+
+                if hasattr(compile_info, 'cxx_standard'):
+                    cxx_std = str(getattr(compile_info, 'cxx_standard', '') or '').strip()
+                elif isinstance(compile_info, dict):
+                    cxx_std = str(compile_info.get('cxx_standard', '') or '').strip()
+
+                if cxx_std:
+                    cxx_standard = cxx_std
+
+                for inc in include_list:
+                    include_flag = "-I" + str(inc)
+                    if include_flag not in seen_inc:
+                        seen_inc.add(include_flag)
+                        include_dirs.append(include_flag)
+
+                for macro_name, macro_value in define_map.items():
+                    key = str(macro_name or '').strip()
+                    if not key:
+                        continue
+                    if macro_value is None or str(macro_value) == "":
+                        define_flag = f"-D{key}"
+                    else:
+                        define_flag = f"-D{key}={macro_value}"
+                    if define_flag not in seen_def:
+                        seen_def.add(define_flag)
+                        define_flags.append(define_flag)
+
+        return include_dirs, define_flags, cxx_standard
+
+    def _collect_clang_error_diagnostics_for_test(self,
+                                                  test_path: str,
+                                                  include_dirs: List[str],
+                                                  define_flags: List[str],
+                                                  cxx_standard: str) -> List[str]:
+        """使用libclang收集测试文件级错误诊断（模拟编辑器红波浪线错误）。"""
+        if not getattr(self.compile_analyzer, 'use_clang', False):
+            return []
+
+        clang_index = getattr(self.compile_analyzer, 'clang_index', None)
+        if clang_index is None:
+            return []
+
+        test_abs = os.path.abspath(test_path)
+        parse_args = [
+            "-x", "c++",
+            f"-std={cxx_standard or 'c++14'}",
+        ]
+        parse_args.extend(include_dirs)
+        parse_args.extend(define_flags)
+
+        try:
+            tu = clang_index.parse(test_abs, args=parse_args)
+        except Exception as parse_error:
+            self._print_key_event(
+                f"[PreCompileCheck] clang parse failed for {Path(test_abs).name}: {parse_error}",
+                bg_code="43"
+            )
+            return []
+
+        diagnostics: List[str] = []
+        for diag in getattr(tu, 'diagnostics', []):
+            severity = int(getattr(diag, 'severity', 0) or 0)
+            if severity < 3:
+                continue
+
+            loc = getattr(diag, 'location', None)
+            loc_file = str(getattr(getattr(loc, 'file', None), 'name', '') or '')
+            loc_abs = os.path.abspath(loc_file) if loc_file else ''
+            if loc_abs != test_abs:
+                continue
+
+            line = int(getattr(loc, 'line', 1) or 1)
+            col = int(getattr(loc, 'column', 1) or 1)
+            message = str(getattr(diag, 'spelling', '') or '').strip()
+            diagnostics.append(f"{test_abs}:{line}:{col}: error: {message}")
+
+        return diagnostics
+
+    def _preclean_test_file_with_clang(self,
+                                       test_path: str,
+                                       test_name: str,
+                                       target_symbol: str,
+                                       include_dirs: List[str],
+                                       define_flags: List[str],
+                                       cxx_standard: str,
+                                       log_dir: str,
+                                       timestamp: str,
+                                       blocked_redefinition_symbols: Optional[set] = None,
+                                       auto_fix_enabled: bool = True,
+                                       max_attempts: int = 2) -> bool:
+        """
+        编译前先用clang诊断清理测试文件中的错误点。
+        仅允许修改 test_path，不触碰源码。
+        """
+        diagnostics = self._collect_clang_error_diagnostics_for_test(
+            test_path=test_path,
+            include_dirs=include_dirs,
+            define_flags=define_flags,
+            cxx_standard=cxx_standard
+        )
+        if not diagnostics:
+            return True
+
+        if not auto_fix_enabled:
+            self._print_key_event(
+                "[PreCompileCheck] clang diagnostics found but auto-fix disabled",
+                bg_code="43"
+            )
+            return False
+
+        attempts = max(1, int(max_attempts or 1))
+        for attempt in range(1, attempts + 1):
+            diagnostics = self._collect_clang_error_diagnostics_for_test(
+                test_path=test_path,
+                include_dirs=include_dirs,
+                define_flags=define_flags,
+                cxx_standard=cxx_standard
+            )
+            if not diagnostics:
+                self._print_key_event(
+                    "[PreCompileCheck] clang diagnostics cleared before compile",
+                    bg_code="42"
+                )
+                return True
+
+            self._print_key_event(
+                f"[PreCompileCheck] Found {len(diagnostics)} clang error(s), auto-fix attempt {attempt}/{attempts}",
+                bg_code="45"
+            )
+            for line in diagnostics[:5]:
+                print(f"  [clang] {line}")
+            if len(diagnostics) > 5:
+                print("  [clang] ... (more diagnostics)")
+
+            clang_error_text = "\n".join(diagnostics)
+            with open(test_path, 'r', encoding='utf-8') as f:
+                current_test_code = f.read()
+
+            fixed_test_code = self.test_generator.fix_test_from_compile_error(
+                current_test_code=current_test_code,
+                compile_error=clang_error_text,
+                function_name=target_symbol,
+                compile_analysis={
+                    "error_type": "syntax",
+                    "root_cause": "clang_editor_diagnostics",
+                    "should_fix": True,
+                    "confidence": 0.95,
+                    "change_direction": ["fix clang diagnostics reported directly on current test file"]
+                },
+                aggressive=(attempt > 1)
+            )
+
+            if blocked_redefinition_symbols:
+                sanitized_code, stripped_symbols = self._remove_symbol_definitions_from_code(
+                    fixed_test_code,
+                    sorted(list(blocked_redefinition_symbols)),
+                    protected_symbols=[target_symbol]
+                )
+                if stripped_symbols:
+                    self._print_key_event(
+                        "[PreCompileCheck] Stripped forbidden redefinitions: "
+                        + ", ".join(stripped_symbols[:6])
+                        + (" ..." if len(stripped_symbols) > 6 else ""),
+                        bg_code="45"
+                    )
+                    fixed_test_code = sanitized_code
+
+            if fixed_test_code == current_test_code:
+                self._print_key_event(
+                    "[PreCompileCheck] No code change produced by clang pre-fix",
+                    bg_code="43"
+                )
+                continue
+
+            with open(test_path, 'w', encoding='utf-8') as f:
+                f.write(fixed_test_code)
+
+            diff_log_path = self._emit_fix_diff(
+                before_code=current_test_code,
+                after_code=fixed_test_code,
+                log_dir=log_dir,
+                test_name=test_name,
+                phase="precompile_clang",
+                attempt=attempt,
+                timestamp=timestamp
+            )
+
+            prefix_log_path = os.path.join(log_dir, f"{test_name}_precompile_clang_attempt{attempt}_{timestamp}.log")
+            with open(prefix_log_path, 'w', encoding='utf-8') as log_file:
+                log_file.write("Auto-fix triggered by clang pre-compile diagnostics.\n\n")
+                log_file.write("Diagnostics:\n")
+                log_file.write(clang_error_text)
+                if diff_log_path:
+                    log_file.write("\n\nUnified diff patch log:\n")
+                    log_file.write(diff_log_path)
+                    log_file.write("\n")
+            print(f"  ↳ Pre-compile clang fix applied: {test_path}")
+            print(f"  ↳ Pre-compile clang log saved: {prefix_log_path}")
+
+        remaining = self._collect_clang_error_diagnostics_for_test(
+            test_path=test_path,
+            include_dirs=include_dirs,
+            define_flags=define_flags,
+            cxx_standard=cxx_standard
+        )
+        if remaining:
+            self._print_key_event(
+                f"[PreCompileCheck] Remaining clang errors after pre-fix: {len(remaining)}",
+                bg_code="43"
+            )
+            return False
+        return True
+
     @staticmethod
     def _remove_symbol_definitions_from_test_file(test_path: str,
                                                   symbols: List[str],
@@ -2328,22 +2565,7 @@ test/CMakeLists.txt current:
             print("-" * 40)
             
             # 构建编译命令
-            # 收集include目录
-            include_dirs = ["-I" + self.include_dir]
-            
-            # 从compile_commands.json中提取include路径
-            if hasattr(self.compile_analyzer, 'compile_info'):
-                for src_file, compile_info in self.compile_analyzer.compile_info.items():
-                    include_list = []
-                    if hasattr(compile_info, 'include_dirs'):
-                        include_list = compile_info.include_dirs
-                    elif isinstance(compile_info, dict):
-                        include_list = compile_info.get('includes') or compile_info.get('include_dirs', [])
-                    
-                    for inc in include_list:
-                        include_flag = "-I" + inc
-                        if include_flag not in include_dirs:
-                            include_dirs.append(include_flag)
+            include_dirs, define_flags, inferred_cxx_standard = self._collect_compile_flags_from_scope()
             
             # 准备编译命令
             source_files_for_test = self._resolve_source_files_for_test(test_name, source_files)
@@ -2407,6 +2629,25 @@ test/CMakeLists.txt current:
                             + (" ..." if len(pre_removed) > 6 else ""),
                             bg_code="45"
                         )
+
+                preclean_ok = self._preclean_test_file_with_clang(
+                    test_path=test_path,
+                    test_name=test_name,
+                    target_symbol=target_symbol,
+                    include_dirs=include_dirs,
+                    define_flags=define_flags,
+                    cxx_standard=inferred_cxx_standard,
+                    log_dir=log_dir,
+                    timestamp=timestamp,
+                    blocked_redefinition_symbols=blocked_redefinition_symbols,
+                    auto_fix_enabled=auto_fix_compile_errors,
+                    max_attempts=min(2, max_fix_attempts + 1)
+                )
+                if not preclean_ok:
+                    self._print_key_event(
+                        "[PreCompileCheck] clang diagnostics still present -> continue to compiler loop",
+                        bg_code="43"
+                    )
 
                 while not test_finished:
                     compile_success = False
