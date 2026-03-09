@@ -1988,7 +1988,7 @@ test/CMakeLists.txt current:
         cc_entry_args.extend(["-c", test_abs])
 
         cc_entry = {
-            "directory": self.project_dir,
+            "directory": os.path.dirname(os.path.abspath(getattr(self.compile_analyzer, 'file', '') or self.project_dir)),
             "file": test_abs,
             "command": subprocess.list2cmdline(cc_entry_args),
         }
@@ -2856,6 +2856,11 @@ test/CMakeLists.txt current:
             include_dirs, define_flags, inferred_cxx_standard = self._collect_compile_flags_from_scope(
                 target_symbol=target_symbol
             )
+            gtest_link_inputs = self._resolve_gtest_link_inputs(
+                include_dirs,
+                build_path,
+                prefer_sources=(os.name == 'nt' and not self._is_msvc_compiler(compiler_path))
+            )
             
             try:
                 compile_result = None
@@ -2924,12 +2929,6 @@ test/CMakeLists.txt current:
                 source_files_for_test = self._resolve_source_files_for_test(test_name, source_files)
                 source_files_active = list(source_files_for_test)
                 full_source_link_mode = False
-
-                gtest_link_inputs = self._resolve_gtest_link_inputs(
-                    include_dirs,
-                    build_path,
-                    prefer_sources=(os.name == 'nt' and not self._is_msvc_compiler(compiler_path))
-                )
                 compile_cmd = self._build_compile_command(
                     compiler_path=compiler_path,
                     include_dirs=include_dirs,
