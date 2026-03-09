@@ -2631,27 +2631,8 @@ test/CMakeLists.txt current:
             self._print_key_node(f"[Test] {test_file}", bg_code="100")
             print("-" * 40)
             
-            # 构建编译命令
+            # 预编译阶段：先收集clang诊断并尝试清理（在任何测试编译命令执行前）
             include_dirs, define_flags, inferred_cxx_standard = self._collect_compile_flags_from_scope()
-            
-            # 准备编译命令
-            source_files_for_test = self._resolve_source_files_for_test(test_name, source_files)
-            source_files_active = list(source_files_for_test)
-            full_source_link_mode = False
-
-            gtest_link_inputs = self._resolve_gtest_link_inputs(
-                include_dirs,
-                build_path,
-                prefer_sources=(os.name == 'nt' and not self._is_msvc_compiler(compiler_path))
-            )
-            compile_cmd = self._build_compile_command(
-                compiler_path=compiler_path,
-                include_dirs=include_dirs,
-                source_files=source_files_active,
-                test_path=test_path,
-                exe_path=exe_path,
-                gtest_link_inputs=gtest_link_inputs
-            )
             
             try:
                 compile_result = None
@@ -2715,6 +2696,25 @@ test/CMakeLists.txt current:
                         "[PreCompileCheck] clang diagnostics still present -> continue to compiler loop",
                         bg_code="43"
                     )
+
+                # 构建编译命令（位于preclean之后，确保先做clangd风格预清理）
+                source_files_for_test = self._resolve_source_files_for_test(test_name, source_files)
+                source_files_active = list(source_files_for_test)
+                full_source_link_mode = False
+
+                gtest_link_inputs = self._resolve_gtest_link_inputs(
+                    include_dirs,
+                    build_path,
+                    prefer_sources=(os.name == 'nt' and not self._is_msvc_compiler(compiler_path))
+                )
+                compile_cmd = self._build_compile_command(
+                    compiler_path=compiler_path,
+                    include_dirs=include_dirs,
+                    source_files=source_files_active,
+                    test_path=test_path,
+                    exe_path=exe_path,
+                    gtest_link_inputs=gtest_link_inputs
+                )
 
                 while not test_finished:
                     compile_success = False
