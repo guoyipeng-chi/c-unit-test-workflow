@@ -14,6 +14,7 @@ import re
 import difflib
 import shlex
 import xml.etree.ElementTree as ET
+import tempfile
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -1748,14 +1749,101 @@ test/CMakeLists.txt current:
                     symbols.append(symbol)
         return symbols
 
-    def _collect_compile_flags_from_scope(self) -> Tuple[List[str], List[str], str]:
-        """从compile_commands作用域收集 include/define/C++标准，供诊断预检查复用。"""
+    def _collect_compile_flags_from_scope(self,
+                                          target_symbol: Optional[str] = None) -> Tuple[List[str], List[str], str]:
+        """收集诊断用编译参数：优先目标函数对应TU，其次回退scope汇总。"""
         include_dirs = ["-I" + self.include_dir]
         define_flags: List[str] = []
         cxx_standard = "c++14"
 
         seen_inc = set(include_dirs)
         seen_def = set()
+
+        target_compile_info = None
+        target_source_abs = ""
+        if target_symbol:
+            try:
+                func_map = self.code_analyzer.get_all_functions()
+                target_dep = func_map.get(str(target_symbol).strip())
+                if target_dep and getattr(target_dep, 'source_file', None):
+                    source_file = str(target_dep.source_file)
+                    if os.path.isabs(source_file):
+                        target_source_abs = os.path.abspath(source_file)
+                    else:
+                        target_source_abs = os.path.abspath(os.path.join(self.project_dir, source_file))
+            except Exception:
+                target_source_abs = ""
+
+        if hasattr(self.compile_analyzer, 'compile_info') and target_source_abs:
+            for _, compile_info in self.compile_analyzer.compile_info.items():
+                info_file = ""
+                info_dir = ""
+                if hasattr(compile_info, 'file'):
+                    info_file = str(getattr(compile_info, 'file', '') or '')
+                    info_dir = str(getattr(compile_info, 'directory', '') or '')
+                elif isinstance(compile_info, dict):
+                    info_file = str(compile_info.get('file', '') or '')
+                    info_dir = str(compile_info.get('directory', '') or '')
+
+                if not info_file:
+                    continue
+
+                if os.path.isabs(info_file):
+                    info_abs = os.path.abspath(info_file)
+                else:
+                    base_dir = info_dir if info_dir else self.project_dir
+                    info_abs = os.path.abspath(os.path.join(base_dir, info_file))
+
+                if info_abs == target_source_abs:
+                    target_compile_info = compile_info
+                    break
+
+        if target_compile_info is not None:
+            include_list = []
+            define_map: Dict[str, Optional[str]] = {}
+            cxx_std = ""
+
+            if hasattr(target_compile_info, 'include_dirs'):
+                include_list = list(getattr(target_compile_info, 'include_dirs', []) or [])
+            elif isinstance(target_compile_info, dict):
+                include_list = list(target_compile_info.get('includes') or target_compile_info.get('include_dirs', []) or [])
+
+            if hasattr(target_compile_info, 'defines'):
+                define_map = dict(getattr(target_compile_info, 'defines', {}) or {})
+            elif isinstance(target_compile_info, dict):
+                define_map = dict(target_compile_info.get('defines') or {})
+
+            if hasattr(target_compile_info, 'cxx_standard'):
+                cxx_std = str(getattr(target_compile_info, 'cxx_standard', '') or '').strip()
+            elif isinstance(target_compile_info, dict):
+                cxx_std = str(target_compile_info.get('cxx_standard', '') or '').strip()
+
+            if cxx_std:
+                cxx_standard = cxx_std
+
+            for inc in include_list:
+                include_flag = "-I" + str(inc)
+                if include_flag not in seen_inc:
+                    seen_inc.add(include_flag)
+                    include_dirs.append(include_flag)
+
+            for macro_name, macro_value in define_map.items():
+                key = str(macro_name or '').strip()
+                if not key:
+                    continue
+                if macro_value is None or str(macro_value) == "":
+                    define_flag = f"-D{key}"
+                else:
+                    define_flag = f"-D{key}={macro_value}"
+                if define_flag not in seen_def:
+                    seen_def.add(define_flag)
+                    define_flags.append(define_flag)
+
+            self._print_key_event(
+                f"[PreCompileCheck] compile flags source=target_tu ({Path(target_source_abs).name})",
+                bg_code="46"
+            )
+            return include_dirs, define_flags, cxx_standard
 
         if hasattr(self.compile_analyzer, 'compile_info'):
             for _, compile_info in self.compile_analyzer.compile_info.items():
@@ -1799,6 +1887,11 @@ test/CMakeLists.txt current:
                         seen_def.add(define_flag)
                         define_flags.append(define_flag)
 
+        self._print_key_event(
+            "[PreCompileCheck] compile flags source=scope_fallback",
+            bg_code="45"
+        )
+
         return include_dirs, define_flags, cxx_standard
 
     def _collect_clang_error_diagnostics_for_test(self,
@@ -1810,7 +1903,12 @@ test/CMakeLists.txt current:
         收集测试文件级错误诊断。
         优先使用 clangd --check（与 VS Code clangd 同源），失败时回退到 libclang。
         """
-        clangd_diagnostics = self._collect_clangd_error_diagnostics_for_test(test_path)
+        clangd_diagnostics = self._collect_clangd_error_diagnostics_for_test(
+            test_path=test_path,
+            include_dirs=include_dirs,
+            define_flags=define_flags,
+            cxx_standard=cxx_standard
+        )
         if clangd_diagnostics:
             return clangd_diagnostics
 
@@ -1862,30 +1960,55 @@ test/CMakeLists.txt current:
 
         return diagnostics
 
-    def _collect_clangd_error_diagnostics_for_test(self, test_path: str) -> List[str]:
+    def _collect_clangd_error_diagnostics_for_test(self,
+                                                   test_path: str,
+                                                   include_dirs: List[str],
+                                                   define_flags: List[str],
+                                                   cxx_standard: str) -> List[str]:
         """使用 clangd --check 获取诊断，尽量与 VS Code 中 clangd 的诊断来源一致。"""
         clangd_path = self._find_tool("clangd")
         if not clangd_path:
             return []
 
         test_abs = os.path.abspath(test_path)
-        compile_db = os.path.dirname(os.path.abspath(getattr(self.compile_analyzer, 'file', '') or self.project_dir))
-
+        compiler_for_check = self._find_tool("clang++") or self._find_tool("g++") or "clang++"
         cmd = [
             clangd_path,
             f"--check={test_abs}",
-            f"--compile-commands-dir={compile_db}",
             "--log=error",
         ]
 
+        cc_entry_args = [
+            compiler_for_check,
+            "-x", "c++",
+            f"-std={cxx_standard or 'c++14'}",
+        ]
+        cc_entry_args.extend(include_dirs or [])
+        cc_entry_args.extend(define_flags or [])
+        cc_entry_args.extend(["-c", test_abs])
+
+        cc_entry = {
+            "directory": self.project_dir,
+            "file": test_abs,
+            "command": subprocess.list2cmdline(cc_entry_args),
+        }
+
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                cwd=self.project_dir,
-                timeout=30
-            )
+            with tempfile.TemporaryDirectory(prefix="ut_clangd_check_") as temp_db_dir:
+                temp_db_path = os.path.join(temp_db_dir, "compile_commands.json")
+                with open(temp_db_path, 'w', encoding='utf-8') as f:
+                    json.dump([cc_entry], f, ensure_ascii=False, indent=2)
+
+                run_cmd = list(cmd)
+                run_cmd.insert(2, f"--compile-commands-dir={temp_db_dir}")
+
+                result = subprocess.run(
+                    run_cmd,
+                    capture_output=True,
+                    text=True,
+                    cwd=self.project_dir,
+                    timeout=30
+                )
         except Exception as clangd_error:
             self._print_key_event(
                 f"[PreCompileCheck] clangd --check failed: {clangd_error}",
@@ -2730,7 +2853,9 @@ test/CMakeLists.txt current:
             print("-" * 40)
             
             # 预编译阶段：先收集clang诊断并尝试清理（在任何测试编译命令执行前）
-            include_dirs, define_flags, inferred_cxx_standard = self._collect_compile_flags_from_scope()
+            include_dirs, define_flags, inferred_cxx_standard = self._collect_compile_flags_from_scope(
+                target_symbol=target_symbol
+            )
             
             try:
                 compile_result = None
