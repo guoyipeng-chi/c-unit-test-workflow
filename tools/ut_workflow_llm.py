@@ -1948,7 +1948,8 @@ test/CMakeLists.txt current:
                                                   cxx_standard: str) -> List[str]:
         """
         收集测试文件级错误诊断。
-        优先使用 clangd --check（与 VS Code clangd 同源），失败时回退到 libclang。
+        仅使用 clangd --check（与 VS Code clangd 同源）。
+        若clangd不可用或解析失败，则跳过预修复，避免不同诊断源引入偏差。
         """
         clangd_diagnostics = self._collect_clangd_error_diagnostics_for_test(
             test_path=test_path,
@@ -1960,52 +1961,96 @@ test/CMakeLists.txt current:
             return clangd_diagnostics
 
         self._print_key_event(
-            "[PreCompileCheck] clangd diagnostics unavailable -> fallback to libclang",
+            "[PreCompileCheck] clangd diagnostics unavailable -> skip preclean (libclang disabled)",
             bg_code="45"
         )
+        return []
 
-        if not getattr(self.compile_analyzer, 'use_clang', False):
+    def _normalize_clangd_output_with_llm(self,
+                                          raw_output: str,
+                                          test_abs: str,
+                                          max_items: int = 20) -> List[str]:
+        """当正则无法稳定提取clangd输出时，用LLM归一化为统一diagnostic前缀格式。"""
+        text = str(raw_output or "").strip()
+        if not text:
             return []
 
-        clang_index = getattr(self.compile_analyzer, 'clang_index', None)
-        if clang_index is None:
-            return []
+        prompt = f"""You normalize clangd --check output into diagnostics for ONE target file.
+Return STRICT JSON only:
+{{
+  "diagnostics": [
+    {{"line": 1, "col": 1, "severity": "error", "message": "..."}}
+  ]
+}}
 
-        test_abs = os.path.abspath(test_path)
-        parse_args = [
-            "-x", "c++",
-            f"-std={cxx_standard or 'c++14'}",
-        ]
-        parse_args.extend(include_dirs)
-        parse_args.extend(define_flags)
+Rules:
+- Keep only real compile errors/fatal errors related to target file.
+- Ignore warning/note unless it is a fatal error chain.
+- If no valid error, return {{"diagnostics":[]}}.
+- No markdown, no extra text.
+
+Target file:
+{test_abs}
+
+clangd raw output:
+```
+{text[:12000]}
+```
+"""
 
         try:
-            tu = clang_index.parse(test_abs, args=parse_args)
-        except Exception as parse_error:
+            response = self.llm_client.generate(
+                prompt,
+                temperature=0.0,
+                max_tokens=500,
+                top_p=0.9
+            )
+            parsed = self._extract_json_object_from_text(response)
+            if not isinstance(parsed, dict):
+                return []
+
+            rows = parsed.get("diagnostics", [])
+            if not isinstance(rows, list):
+                return []
+
+            diagnostics: List[str] = []
+            seen = set()
+            for item in rows[:max_items]:
+                if not isinstance(item, dict):
+                    continue
+
+                sev = str(item.get("severity", "error") or "error").strip().lower()
+                if sev not in {"error", "fatal error", "fatal"}:
+                    continue
+
+                try:
+                    line = int(item.get("line", 1) or 1)
+                except Exception:
+                    line = 1
+                try:
+                    col = int(item.get("col", 1) or 1)
+                except Exception:
+                    col = 1
+
+                line = max(1, line)
+                col = max(1, col)
+                msg = str(item.get("message", "") or "").strip()
+                if not msg:
+                    continue
+
+                diag_text = f"{test_abs}:{line}:{col}: error: {msg}"
+                if diag_text in seen:
+                    continue
+                seen.add(diag_text)
+                diagnostics.append(diag_text)
+
+            return diagnostics
+        except Exception as llm_error:
             self._print_key_event(
-                f"[PreCompileCheck] clang parse failed for {Path(test_abs).name}: {parse_error}",
+                f"[PreCompileCheck] LLM normalize clangd output failed: {llm_error}",
                 bg_code="43"
             )
             return []
-
-        diagnostics: List[str] = []
-        for diag in getattr(tu, 'diagnostics', []):
-            severity = int(getattr(diag, 'severity', 0) or 0)
-            if severity < 3:
-                continue
-
-            loc = getattr(diag, 'location', None)
-            loc_file = str(getattr(getattr(loc, 'file', None), 'name', '') or '')
-            loc_abs = os.path.abspath(loc_file) if loc_file else ''
-            if loc_abs != test_abs:
-                continue
-
-            line = int(getattr(loc, 'line', 1) or 1)
-            col = int(getattr(loc, 'column', 1) or 1)
-            message = str(getattr(diag, 'spelling', '') or '').strip()
-            diagnostics.append(f"{test_abs}:{line}:{col}: error: {message}")
-
-        return diagnostics
 
     def _collect_clangd_error_diagnostics_for_test(self,
                                                    test_path: str,
@@ -2114,6 +2159,23 @@ test/CMakeLists.txt current:
                 f"[PreCompileCheck] diagnostics source=clangd --check ({len(diagnostics)} errors)",
                 bg_code="46"
             )
+            return diagnostics
+
+        if result.returncode != 0:
+            self._print_key_event(
+                "[PreCompileCheck] regex parse empty -> try LLM normalize clangd output",
+                bg_code="45"
+            )
+            llm_diagnostics = self._normalize_clangd_output_with_llm(
+                raw_output=combined,
+                test_abs=test_abs
+            )
+            if llm_diagnostics:
+                self._print_key_event(
+                    f"[PreCompileCheck] diagnostics source=clangd+llm-prefix ({len(llm_diagnostics)} errors)",
+                    bg_code="46"
+                )
+                return llm_diagnostics
 
         return diagnostics
 
