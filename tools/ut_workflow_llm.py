@@ -1945,7 +1945,8 @@ test/CMakeLists.txt current:
                                                   test_path: str,
                                                   include_dirs: List[str],
                                                   define_flags: List[str],
-                                                  cxx_standard: str) -> List[str]:
+                                                  cxx_standard: str,
+                                                  clangd_compile_commands_dir: Optional[str] = None) -> List[str]:
         """
         收集测试文件级错误诊断。
         仅使用 clangd --check（与 VS Code clangd 同源）。
@@ -1955,7 +1956,8 @@ test/CMakeLists.txt current:
             test_path=test_path,
             include_dirs=include_dirs,
             define_flags=define_flags,
-            cxx_standard=cxx_standard
+            cxx_standard=cxx_standard,
+            compile_commands_dir=clangd_compile_commands_dir
         )
         if clangd_diagnostics:
             return clangd_diagnostics
@@ -2056,7 +2058,8 @@ clangd raw output:
                                                    test_path: str,
                                                    include_dirs: List[str],
                                                    define_flags: List[str],
-                                                   cxx_standard: str) -> List[str]:
+                                                   cxx_standard: str,
+                                                   compile_commands_dir: Optional[str] = None) -> List[str]:
         """使用 clangd --check 获取诊断，尽量与 VS Code 中 clangd 的诊断来源一致。"""
         clangd_path = self._find_tool("clangd")
         if not clangd_path:
@@ -2085,15 +2088,19 @@ clangd raw output:
             "command": subprocess.list2cmdline(cc_entry_args),
         }
 
+        selected_cc_dir = ""
+        if compile_commands_dir:
+            candidate = str(compile_commands_dir).strip()
+            if candidate:
+                if os.path.isfile(candidate):
+                    selected_cc_dir = os.path.dirname(os.path.abspath(candidate))
+                elif os.path.isdir(candidate):
+                    selected_cc_dir = os.path.abspath(candidate)
+
         try:
-            with tempfile.TemporaryDirectory(prefix="ut_clangd_check_") as temp_db_dir:
-                temp_db_path = os.path.join(temp_db_dir, "compile_commands.json")
-                with open(temp_db_path, 'w', encoding='utf-8') as f:
-                    json.dump([cc_entry], f, ensure_ascii=False, indent=2)
-
+            if selected_cc_dir:
                 run_cmd = list(cmd)
-                run_cmd.insert(2, f"--compile-commands-dir={temp_db_dir}")
-
+                run_cmd.insert(2, f"--compile-commands-dir={selected_cc_dir}")
                 result = subprocess.run(
                     run_cmd,
                     capture_output=True,
@@ -2101,6 +2108,22 @@ clangd raw output:
                     cwd=self.project_dir,
                     timeout=30
                 )
+            else:
+                with tempfile.TemporaryDirectory(prefix="ut_clangd_check_") as temp_db_dir:
+                    temp_db_path = os.path.join(temp_db_dir, "compile_commands.json")
+                    with open(temp_db_path, 'w', encoding='utf-8') as f:
+                        json.dump([cc_entry], f, ensure_ascii=False, indent=2)
+
+                    run_cmd = list(cmd)
+                    run_cmd.insert(2, f"--compile-commands-dir={temp_db_dir}")
+
+                    result = subprocess.run(
+                        run_cmd,
+                        capture_output=True,
+                        text=True,
+                        cwd=self.project_dir,
+                        timeout=30
+                    )
         except Exception as clangd_error:
             self._print_key_event(
                 f"[PreCompileCheck] clangd --check failed: {clangd_error}",
@@ -2155,8 +2178,9 @@ clangd raw output:
             diagnostics.append(diag_text)
 
         if diagnostics:
+            source_label = f"clangd --check db={selected_cc_dir}" if selected_cc_dir else "clangd --check"
             self._print_key_event(
-                f"[PreCompileCheck] diagnostics source=clangd --check ({len(diagnostics)} errors)",
+                f"[PreCompileCheck] diagnostics source={source_label} ({len(diagnostics)} errors)",
                 bg_code="46"
             )
             return diagnostics
@@ -2257,6 +2281,7 @@ clangd raw output:
                                        log_dir: str,
                                        timestamp: str,
                                        blocked_redefinition_symbols: Optional[set] = None,
+                                       clangd_compile_commands_dir: Optional[str] = None,
                                        auto_fix_enabled: bool = True,
                                        max_attempts: int = 2) -> bool:
         """
@@ -2267,7 +2292,8 @@ clangd raw output:
             test_path=test_path,
             include_dirs=include_dirs,
             define_flags=define_flags,
-            cxx_standard=cxx_standard
+            cxx_standard=cxx_standard,
+            clangd_compile_commands_dir=clangd_compile_commands_dir
         )
         if not diagnostics:
             return True
@@ -2286,7 +2312,8 @@ clangd raw output:
                 test_path=test_path,
                 include_dirs=include_dirs,
                 define_flags=define_flags,
-                cxx_standard=cxx_standard
+                cxx_standard=cxx_standard,
+                clangd_compile_commands_dir=clangd_compile_commands_dir
             )
             if not diagnostics:
                 self._print_key_event(
@@ -2370,7 +2397,8 @@ clangd raw output:
             test_path=test_path,
             include_dirs=include_dirs,
             define_flags=define_flags,
-            cxx_standard=cxx_standard
+            cxx_standard=cxx_standard,
+            clangd_compile_commands_dir=clangd_compile_commands_dir
         )
         if remaining:
             self._print_key_event(
@@ -2823,6 +2851,7 @@ clangd raw output:
                   web_research_max_results: int = 4,
                   experience_learning_enabled: bool = True,
                   experience_top_k: int = 3,
+                  preclean_compile_commands: Optional[str] = None,
                   compile_command_template: Optional[str] = None,
                   compile_command_cwd: Optional[str] = None,
                   run_command_template: Optional[str] = None,
@@ -2844,6 +2873,7 @@ clangd raw output:
             web_research_max_results: 在线检索最多返回条数
             experience_learning_enabled: 是否启用经验积累与检索
             experience_top_k: 经验检索返回条数
+            preclean_compile_commands: clangd预修复阶段使用的compile_commands.json路径（可为文件或目录）
             
         Returns:
             是否执行成功
@@ -2938,6 +2968,26 @@ clangd raw output:
         
         print(f"Found {len(source_files)} source file(s)")
 
+        preclean_cc_dir = ""
+        if preclean_compile_commands:
+            cc_candidate = str(preclean_compile_commands).strip()
+            if cc_candidate and not os.path.isabs(cc_candidate):
+                cc_candidate = os.path.abspath(os.path.join(self.project_dir, cc_candidate))
+            if cc_candidate:
+                if os.path.isfile(cc_candidate):
+                    preclean_cc_dir = os.path.dirname(cc_candidate)
+                elif os.path.isdir(cc_candidate):
+                    preclean_cc_dir = cc_candidate
+
+        generated_cc_path = os.path.join(build_path, "compile_commands.json")
+        if not preclean_cc_dir and os.path.exists(generated_cc_path):
+            preclean_cc_dir = build_path
+
+        if preclean_cc_dir:
+            print(f"[PreCompileCheck] Using clangd compile_commands dir: {preclean_cc_dir}")
+        else:
+            print("[PreCompileCheck] No compile_commands dir for clangd preclean, fallback to temp DB")
+
         compiler_path = self._detect_cpp_compiler()
         if not compiler_path:
             print("✗ No C++ compiler found (expected one of: g++, clang++, cl)")
@@ -2961,7 +3011,7 @@ clangd raw output:
             self._print_key_node(f"[Test] {test_file}", bg_code="100")
             print("-" * 40)
             
-            # 预编译阶段：先收集clang诊断并尝试清理（在任何测试编译命令执行前）
+            # 预编译参数收集（预修复改为首次编译失败后执行）
             include_dirs, define_flags, inferred_cxx_standard = self._collect_compile_flags_from_scope(
                 target_symbol=target_symbol,
                 test_path=test_path
@@ -3016,29 +3066,11 @@ clangd raw output:
                             bg_code="45"
                         )
 
-                preclean_ok = self._preclean_test_file_with_clang(
-                    test_path=test_path,
-                    test_name=test_name,
-                    target_symbol=target_symbol,
-                    include_dirs=include_dirs,
-                    define_flags=define_flags,
-                    cxx_standard=inferred_cxx_standard,
-                    log_dir=log_dir,
-                    timestamp=timestamp,
-                    blocked_redefinition_symbols=blocked_redefinition_symbols,
-                    auto_fix_enabled=auto_fix_compile_errors,
-                    max_attempts=min(2, max_fix_attempts + 1)
-                )
-                if not preclean_ok:
-                    self._print_key_event(
-                        "[PreCompileCheck] clang diagnostics still present -> continue to compiler loop",
-                        bg_code="43"
-                    )
-
-                # 构建编译命令（位于preclean之后，确保先做clangd风格预清理）
+                # 构建编译命令
                 source_files_for_test = self._resolve_source_files_for_test(test_name, source_files)
                 source_files_active = list(source_files_for_test)
                 full_source_link_mode = False
+                preclean_attempted = False
                 compile_cmd = self._build_compile_command(
                     compiler_path=compiler_path,
                     include_dirs=include_dirs,
@@ -3113,6 +3145,34 @@ clangd raw output:
                         print(f"  ↳ Compile log saved: {compile_log_path}")
 
                         compile_output_full = (compile_result.stdout or "") + "\n" + (compile_result.stderr or "")
+
+                        if not preclean_attempted:
+                            preclean_attempted = True
+                            self._print_key_event(
+                                "[PreCompileCheck] Trigger preclean after first compile failure",
+                                bg_code="45"
+                            )
+                            preclean_ok = self._preclean_test_file_with_clang(
+                                test_path=test_path,
+                                test_name=test_name,
+                                target_symbol=target_symbol,
+                                include_dirs=include_dirs,
+                                define_flags=define_flags,
+                                cxx_standard=inferred_cxx_standard,
+                                log_dir=log_dir,
+                                timestamp=timestamp,
+                                blocked_redefinition_symbols=blocked_redefinition_symbols,
+                                clangd_compile_commands_dir=preclean_cc_dir or None,
+                                auto_fix_enabled=auto_fix_compile_errors,
+                                max_attempts=min(2, max_fix_attempts + 1)
+                            )
+                            if preclean_ok:
+                                compile_round += 1
+                                continue
+                            self._print_key_event(
+                                "[PreCompileCheck] preclean had no effective fix -> enter main fix loop",
+                                bg_code="43"
+                            )
 
                         issue_domain = self._classify_issue_domain(compile_output_full, phase_hint="compile")
                         if issue_domain == "cmakelists":
@@ -4069,6 +4129,7 @@ Usage:
                           web_research_max_results: int = 4,
                           experience_learning_enabled: bool = True,
                           experience_top_k: int = 3,
+                          preclean_compile_commands: Optional[str] = None,
                           skip_quality_gates: bool = False,
                           quality_strict: bool = False,
                           compile_command_template: Optional[str] = None,
@@ -4092,6 +4153,7 @@ Usage:
             web_research_max_results: 在线检索最大返回条数
             experience_learning_enabled: 是否启用经验积累与检索
             experience_top_k: 经验检索返回条数
+            preclean_compile_commands: 预修复阶段clangd使用的compile_commands路径（文件或目录）
             skip_quality_gates: 是否跳过clang-format/clang-tidy/cppcheck质量闸门
             quality_strict: 质量闸门严格模式（有问题即停止）
         """
@@ -4160,6 +4222,7 @@ Usage:
                 web_research_max_results=web_research_max_results,
                 experience_learning_enabled=experience_learning_enabled,
                 experience_top_k=experience_top_k,
+                preclean_compile_commands=preclean_compile_commands,
                 compile_command_template=compile_command_template,
                 compile_command_cwd=compile_command_cwd,
                 run_command_template=run_command_template,
@@ -4398,6 +4461,12 @@ def main():
         default=None,
         help="Working directory for custom run command (absolute or relative to project_dir)"
     )
+
+    parser.add_argument(
+        "--preclean-compile-commands",
+        default=None,
+        help="compile_commands path for post-compile preclean stage (file or directory)"
+    )
     
     args = parser.parse_args()
 
@@ -4572,6 +4641,7 @@ def main():
             web_research_max_results=max(1, effective_web_research_max_results),
             experience_learning_enabled=effective_experience_learning_enabled,
             experience_top_k=max(1, effective_experience_top_k),
+            preclean_compile_commands=args.preclean_compile_commands,
             skip_quality_gates=effective_skip_quality_gates,
             quality_strict=effective_quality_strict,
             compile_command_template=effective_compile_command_template,
