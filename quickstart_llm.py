@@ -668,6 +668,7 @@ Then verify with:
     
     def run_workflow(self, functions: Optional[list] = None,
                      analyze_only: bool = False,
+                     reuse_existing_tests: bool = False,
                      max_fix_attempts: Optional[int] = None,
                      max_test_fix_attempts: Optional[int] = None,
                      auto_fix_compile_errors: Optional[bool] = None,
@@ -717,6 +718,9 @@ Then verify with:
         
         if analyze_only:
             cmd.append("--analyze-only")
+
+        if reuse_existing_tests:
+            cmd.append("--reuse-existing-tests")
         
         if functions:
             cmd.extend(["--functions"] + functions)
@@ -898,10 +902,11 @@ Then verify with:
 3. Generate Compile Info  - 生成compile_commands.json
 4. Analyze Code           - 仅分析代码（不生成测试）
 5. Generate Tests         - 生成单元测试
-6. Full Workflow          - 执行完整工作流
-7. Exit                   - 退出
+6. Fix Existing Tests     - 修复已有用例（不重新生成）
+7. Full Workflow          - 执行完整工作流
+8. Exit                   - 退出
 
-Enter your choice (1-7):
+Enter your choice (1-8):
 """)
     
     def interactive_mode(self,
@@ -972,6 +977,29 @@ Enter your choice (1-7):
                 if not self.check_environment(prompt_install_compiler=True):
                     print("✗ Environment check failed!")
                     continue
+                func_list, cancelled = self.select_functions_interactively()
+                if cancelled:
+                    print("Selection cancelled.")
+                    continue
+                self.run_workflow(
+                    functions=func_list,
+                    reuse_existing_tests=True,
+                    max_fix_attempts=max_fix_attempts,
+                    max_test_fix_attempts=max_test_fix_attempts,
+                    auto_fix_compile_errors=auto_fix_compile_errors,
+                    auto_fix_test_failures=auto_fix_test_failures,
+                    llm_triage_enabled=llm_triage_enabled,
+                    triage_min_confidence=triage_min_confidence,
+                    web_research_enabled=web_research_enabled,
+                    web_research_max_results=web_research_max_results,
+                    experience_learning_enabled=experience_learning_enabled,
+                    experience_top_k=experience_top_k,
+                    experience_store_path=experience_store_path
+                )
+            elif choice == "7":
+                if not self.check_environment(prompt_install_compiler=True):
+                    print("✗ Environment check failed!")
+                    continue
                 if not self._find_compile_commands():
                     print("No compile_commands.json found. Generating...")
                     if not self.generate_compile_commands():
@@ -989,7 +1017,7 @@ Enter your choice (1-7):
                     experience_top_k=experience_top_k,
                     experience_store_path=experience_store_path
                 )
-            elif choice == "7":
+            elif choice == "8":
                 print("Goodbye!")
                 break
             else:

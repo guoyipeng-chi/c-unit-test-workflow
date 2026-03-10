@@ -3947,6 +3947,7 @@ Usage:
     
     def run_full_workflow(self,
                           target_functions: Optional[List[str]] = None,
+                          reuse_existing_tests: bool = False,
                           skip_run: bool = False,
                           auto_fix_compile_errors: bool = True,
                           max_fix_attempts: int = 2,
@@ -3969,6 +3970,7 @@ Usage:
         
         Args:
             target_functions: 目标函数列表
+            reuse_existing_tests: 复用已有测试文件（跳过生成步骤）
             skip_run: 是否跳过测试执行步骤
             auto_fix_compile_errors: 编译失败后是否自动进入LLM修复阶段
             max_fix_attempts: 最大自动修复重试次数
@@ -3986,7 +3988,21 @@ Usage:
         self.show_workflow_info()
         self.analyze_codebase()
         self.print_compile_info()
-        self.generate_tests(target_functions)
+        if reuse_existing_tests:
+            self._print_key_event(
+                "[Step 3/4] Reuse existing tests (skip generation)",
+                bg_code="44"
+            )
+            existing = self._resolve_target_test_files(self.test_dir, target_functions)
+            if not existing:
+                print("\n✗ No existing *_llm_test.cpp files found for current scope.")
+                print("  Please run generation first, or adjust function scope.")
+                print("\n" + "=" * 60)
+                print("✓ Workflow completed (reuse mode, no existing tests).")
+                return
+            print(f"Found {len(existing)} existing test file(s), continue with verify/quality/run...")
+        else:
+            self.generate_tests(target_functions)
 
         if self.cmakelists_autogen_enabled:
             try:
@@ -4158,6 +4174,12 @@ def main():
         "--skip-run",
         action="store_true",
         help="Skip running tests (only generate, don't execute)"
+    )
+
+    parser.add_argument(
+        "--reuse-existing-tests",
+        action="store_true",
+        help="Reuse existing *_llm_test.cpp files and skip generation step"
     )
 
     parser.add_argument(
@@ -4428,6 +4450,7 @@ def main():
 
         workflow.run_full_workflow(
             target_functions=args.functions,
+            reuse_existing_tests=args.reuse_existing_tests,
             skip_run=args.skip_run,
             auto_fix_compile_errors=effective_auto_fix_compile,
             max_fix_attempts=effective_max_fix_attempts,
