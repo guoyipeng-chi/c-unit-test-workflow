@@ -1750,8 +1750,9 @@ test/CMakeLists.txt current:
         return symbols
 
     def _collect_compile_flags_from_scope(self,
-                                          target_symbol: Optional[str] = None) -> Tuple[List[str], List[str], str]:
-        """收集诊断用编译参数：优先目标函数对应TU，其次回退scope汇总。"""
+                                          target_symbol: Optional[str] = None,
+                                          test_path: Optional[str] = None) -> Tuple[List[str], List[str], str]:
+        """收集诊断用编译参数：优先测试文件，其次目标函数TU，最后scope汇总。"""
         include_dirs = ["-I" + self.include_dir]
         define_flags: List[str] = []
         cxx_standard = "c++14"
@@ -1759,8 +1760,48 @@ test/CMakeLists.txt current:
         seen_inc = set(include_dirs)
         seen_def = set()
 
+        test_abs = ""
+        if test_path:
+            try:
+                test_abs = os.path.abspath(str(test_path))
+            except Exception:
+                test_abs = ""
+
+        if test_abs:
+            test_parent = os.path.dirname(test_abs)
+            if test_parent:
+                test_parent_flag = "-I" + test_parent
+                if test_parent_flag not in seen_inc:
+                    seen_inc.add(test_parent_flag)
+                    include_dirs.append(test_parent_flag)
+
         target_compile_info = None
         target_source_abs = ""
+
+        if hasattr(self.compile_analyzer, 'compile_info') and test_abs:
+            for _, compile_info in self.compile_analyzer.compile_info.items():
+                info_file = ""
+                info_dir = ""
+                if hasattr(compile_info, 'file'):
+                    info_file = str(getattr(compile_info, 'file', '') or '')
+                    info_dir = str(getattr(compile_info, 'directory', '') or '')
+                elif isinstance(compile_info, dict):
+                    info_file = str(compile_info.get('file', '') or '')
+                    info_dir = str(compile_info.get('directory', '') or '')
+
+                if not info_file:
+                    continue
+
+                if os.path.isabs(info_file):
+                    info_abs = os.path.abspath(info_file)
+                else:
+                    base_dir = info_dir if info_dir else self.project_dir
+                    info_abs = os.path.abspath(os.path.join(base_dir, info_file))
+
+                if info_abs == test_abs:
+                    target_compile_info = compile_info
+                    break
+
         if target_symbol:
             try:
                 func_map = self.code_analyzer.get_all_functions()
@@ -1774,7 +1815,7 @@ test/CMakeLists.txt current:
             except Exception:
                 target_source_abs = ""
 
-        if hasattr(self.compile_analyzer, 'compile_info') and target_source_abs:
+        if target_compile_info is None and hasattr(self.compile_analyzer, 'compile_info') and target_source_abs:
             for _, compile_info in self.compile_analyzer.compile_info.items():
                 info_file = ""
                 info_dir = ""
@@ -1839,8 +1880,14 @@ test/CMakeLists.txt current:
                     seen_def.add(define_flag)
                     define_flags.append(define_flag)
 
+            source_tag = "test_file"
+            source_name = Path(test_abs).name if test_abs else ""
+            if target_source_abs and (not test_abs or target_source_abs != test_abs):
+                source_tag = "target_tu"
+                source_name = Path(target_source_abs).name
+
             self._print_key_event(
-                f"[PreCompileCheck] compile flags source=target_tu ({Path(target_source_abs).name})",
+                f"[PreCompileCheck] compile flags source={source_tag} ({source_name})",
                 bg_code="46"
             )
             return include_dirs, define_flags, cxx_standard
@@ -2854,7 +2901,8 @@ test/CMakeLists.txt current:
             
             # 预编译阶段：先收集clang诊断并尝试清理（在任何测试编译命令执行前）
             include_dirs, define_flags, inferred_cxx_standard = self._collect_compile_flags_from_scope(
-                target_symbol=target_symbol
+                target_symbol=target_symbol,
+                test_path=test_path
             )
             gtest_link_inputs = self._resolve_gtest_link_inputs(
                 include_dirs,
